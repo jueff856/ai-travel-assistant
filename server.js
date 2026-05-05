@@ -3,7 +3,6 @@ const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
-const zlib = require('zlib');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,39 +15,8 @@ const MCP_URL = process.env.FLYAI_MCP_URL || 'https://flyai.open.fliggy.com/mcp'
 const API_KEY = process.env.FLYAI_API_KEY || process.env.FLIGGY_API_KEY || '';
 const SIGN_SECRET = process.env.FLYAI_SIGN_SECRET || 'XSbdYnucPARDc9knhD8+X6hxdD1Nh6ZGI6Hadg25kBw=';
 
-// SHA256
 function sha256(str) {
   return crypto.createHash('sha256').update(str, 'utf8').digest('hex');
-}
-
-// 生成 x-ff-ctx（设备指纹，gzip + AES加密）
-function buildFfCtx() {
-  const ctx = {
-    machine: {
-      platform: os.platform(),
-      arch: os.arch(),
-      cpus: os.cpus().length,
-      memoryTierGB: Math.round(os.totalmem() / 1073741824),
-      osType: os.type(),
-      nodeVersion: process.version,
-    },
-    flyai: { version: '1.0.6' },
-  };
-
-  const json = JSON.stringify(ctx);
-  const gzipped = zlib.gzipSync(Buffer.from(json, 'utf-8'));
-
-  const secret = SIGN_SECRET.trim();
-  if (!secret) return gzipped.toString('base64');
-
-  const key = crypto.createHash('sha256').update(secret, 'utf8').digest();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const encrypted = Buffer.concat([cipher.update(gzipped), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-
-  // 版本前缀 0x01 + iv + encrypted + authTag
-  return Buffer.concat([Buffer.from([0x01]), iv, encrypted, authTag]).toString('base64');
 }
 
 // 请求签名
@@ -99,7 +67,6 @@ async function callMCP(toolName, toolArgs) {
   const headers = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/event-stream',
-    'x-ff-ctx': buildFfCtx(),
     'x-ttid': 'ai2c(sk.clawhub)',
     'User-Agent': `flyai-cli/1.0.6 ${os.platform()}/${os.release()}`,
   };
@@ -116,24 +83,27 @@ async function callMCP(toolName, toolArgs) {
     signal: AbortSignal.timeout(30000),
   });
 
-  const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
+  const responseText = await response.text();
 
+  if (!response.ok) {
+    throw new Error(`飞猪API返回 ${response.status}: ${responseText.slice(0, 200)}`);
+  }
+
+  const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
   let result;
+
   if (contentType.includes('text/event-stream')) {
-    // SSE 响应：逐行读取
-    const text = await response.text();
-    const lines = text.split('\n').filter(l => l.startsWith('data:'));
+    const lines = responseText.split('\n').filter(l => l.startsWith('data:'));
     const lastData = lines[lines.length - 1]?.replace(/^data:\s*/, '');
     result = JSON.parse(lastData);
   } else {
-    result = await response.json();
+    result = JSON.parse(responseText);
   }
 
   if (result.error) {
     throw new Error(result.error.message || JSON.stringify(result.error));
   }
 
-  // MCP result 格式：{ content: [{ type: "text", text: "..." }] }
   const content = result.result?.content;
   if (content && Array.isArray(content)) {
     const textItem = content.find(c => c.type === 'text');
@@ -151,19 +121,35 @@ const CITIES = ['北京','上海','广州','深圳','杭州','成都','重庆','
   '长沙','青岛','厦门','昆明','大连','三亚','海口','苏州','无锡','宁波',
   '天津','郑州','合肥','福州','贵阳','哈尔滨','沈阳','济南','太原','兰州',
   '乌鲁木齐','拉萨','珠海','东莞','佛山','温州','常州','烟台','桂林','丽江',
-  '洛阳','绍兴','嘉兴','湖州','金华','台州','徐州','南通','扬州','镇江'];
+  '洛阳','绍兴','嘉兴','湖州','金华','台州','徐州','南通','扬州','镇江',
+  '玉林','百色','梧州','北海','钦州','防城港','贵港','河池','来宾','贺州'];
 
 function extractCities(message) {
   const found = CITIES.filter(c => message.includes(c));
   const routeMatch = message.match(/([一-龥]{2,4})\s*(?:到|去|飞|→|->)\s*([一-龥]{2,4})/);
   if (routeMatch) {
-    const o = CITIES.find(c => routeMatch[1].includes(c)) || null;
-    const d = CITIES.find(c => routeMatch[2].includes(c)) || null;
+    const o = CITIES.find(c => routeMatch[1].includes(c));
+    const d = CITIES.find(c => routeMatch[2].includes(c));
     if (o && d) return { origin: o, destination: d };
+    // 城市不在列表中时，直接用匹配到的文本
+    if (routeMatch[1].length >= 2 && routeMatch[2].length >= 2) {
+      return { origin: routeMatch[1], destination: routeMatch[2] };
+    }
   }
   if (found.length >= 2) return { origin: found[0], destination: found[1] };
   if (found.length === 1) return { origin: null, destination: found[0] };
   return { origin: null, destination: null };
+}
+
+// 提取地标/景点关键词
+function extractPoi(message) {
+  // "西湖附近的酒店" — 城市名后面的地标
+  const poiMatch = message.match(/(?:杭州|上海|北京|广州|深圳|成都|重庆|武汉|西安|南京|长沙|青岛|厦门|昆明|大连|三亚|海口|苏州|无锡|宁波|天津|郑州|合肥|福州|贵阳|哈尔滨|沈阳|济南|太原|兰州|桂林|丽江|珠海|东莞|佛山|温州|常州|烟台|洛阳|绍兴|嘉兴|湖州|金华|台州|徐州|南通|扬州|镇江|玉林)([一-龥]{2,6})(?:附近|周边|旁边)/);
+  if (poiMatch) return poiMatch[1];
+  // "西湖附近的酒店" — 无城市前缀
+  const plainMatch = message.match(/([一-龥]{2,6})(?:附近|周边|旁边)的?(?:酒店|住宿|宾馆|民宿|客栈)/);
+  if (plainMatch) return plainMatch[1];
+  return null;
 }
 
 function resolveDate(message) {
@@ -188,26 +174,28 @@ function parseIntent(message) {
   else if (trainKw.some(k => message.includes(k))) intent = 'train';
 
   const { origin, destination } = extractCities(message);
+  const poi = extractPoi(message);
   const date = resolveDate(message);
-  return { intent, origin, destination, date };
+  return { intent, origin, destination, poi, date };
 }
 
 // 搜索函数
-async function searchHotels(city, date) {
-  const args = { 'dest-name': city || '杭州', sort: 'price_asc' };
-  if (date) args['check-in-date'] = date;
+async function searchHotels(city, date, poi) {
+  const args = { destName: city || '杭州', sort: 'price_asc', limit: 10 };
+  if (date) args.checkInDate = date;
+  if (poi) args.poiName = poi;
   return callMCP('search_hotels', args);
 }
 
 async function searchFlights(origin, destination, date) {
-  const args = { origin: origin || '上海', destination: destination || '北京' };
-  if (date) args['dep-date'] = date;
+  const args = { origin: origin || '上海', destination: destination || '北京', limit: 10 };
+  if (date) args.depDate = date;
   return callMCP('search_flight', args);
 }
 
 async function searchTrains(origin, destination, date) {
-  const args = { origin: origin || '上海', destination: destination || '杭州' };
-  if (date) args['dep-date'] = date;
+  const args = { origin: origin || '上海', destination: destination || '杭州', limit: 10 };
+  if (date) args.depDate = date;
   return callMCP('search_domestic_train', args);
 }
 
@@ -285,12 +273,12 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    const { intent, origin, destination, date } = parseIntent(message);
+    const { intent, origin, destination, poi, date } = parseIntent(message);
     let reply;
 
     switch (intent) {
       case 'hotel': {
-        const data = await searchHotels(destination, date);
+        const data = await searchHotels(destination, date, poi);
         reply = formatHotels(data, destination);
         break;
       }
@@ -317,7 +305,7 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// 本地开发：node server.js
+// 本地开发
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`AI旅行助手已启动: http://localhost:${PORT}`);
