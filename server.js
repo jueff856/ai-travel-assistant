@@ -368,16 +368,6 @@ function formatFlights(data, origin, destination) {
   return `为您找到${label}的航班：\n\n${lines}`;
 }
 
-// 中转枢纽站（按区域分组）
-const TRANSFER_HUBS = {
-  '广州南': ['南宁东','长沙南','贵阳北','武汉','昆明南'],
-  '南宁东': ['广州南','昆明南','贵阳北','长沙南'],
-  '长沙南': ['广州南','武汉','南昌西','贵阳北','南宁东'],
-  '武汉': ['广州南','长沙南','郑州东','合肥南'],
-  '贵阳北': ['广州南','南宁东','昆明南','长沙南'],
-  '昆明南': ['南宁东','贵阳北','广州南','长沙南'],
-};
-
 // 判断车次是否为动车/高铁
 function isHighSpeed(trainNo) {
   return /^[DGCC]/.test(trainNo);
@@ -417,24 +407,16 @@ function formatTrains(data, origin, destination) {
   return `为您找到${label}的火车票：\n\n${lines}`;
 }
 
-// 查找中转方案
+// 查找中转方案（多枢纽对比，选最优）
 async function searchTransferTrains(origin, destination, date) {
-  // 找出同时连接 origin 和 destination 的枢纽站
-  const hubCandidates = Object.entries(TRANSFER_HUBS).filter(([hub, connects]) => {
-    // 枢纽站本身不能是出发或到达
-    if (hub === origin || hub === destination) return false;
-    // 枢纽站应该能到达目的地（简化：只要在连接列表或目的地本身是枢纽）
-    return true;
-  }).map(([hub]) => hub);
-
-  // 优先选距离出发地较近的枢纽（广州南对广西/湖南，南宁东对广西）
-  const priorityHubs = ['广州南', '南宁东', '长沙南', '武汉', '贵阳北', '昆明南'];
-  const hubs = priorityHubs.filter(h => hubCandidates.includes(h));
+  const priorityHubs = ['南宁东', '广州南', '长沙南', '贵阳北', '武汉', '昆明南'];
+  // 过滤掉出发/到达站本身
+  const hubs = priorityHubs.filter(h => h !== origin && h !== destination);
   if (hubs.length === 0) return null;
 
-  // 只查第一个枢纽的中转方案（避免太多并发请求）
-  const hub = hubs[0];
-  try {
+  // 同时查前2个枢纽（并发请求）
+  const hubsToTry = hubs.slice(0, 2);
+  const results = await Promise.allSettled(hubsToTry.map(async (hub) => {
     const [leg1, leg2] = await Promise.all([
       searchTrains(origin, hub, date),
       searchTrains(hub, destination, date),
@@ -443,7 +425,6 @@ async function searchTransferTrains(origin, destination, date) {
     const leg2Items = leg2?.data?.itemList || [];
     if (leg1Items.length === 0 || leg2Items.length === 0) return null;
 
-    // 从每段取最优的动车/高铁（按车次号去重）
     const pickBest = (items) => {
       const hs = items.filter(it => isHighSpeed(it.journeys?.[0]?.segments?.[0]?.marketingTransportNo || ''));
       const pool = hs.length > 0 ? hs : items;
@@ -459,47 +440,55 @@ async function searchTransferTrains(origin, destination, date) {
     const best1 = pickBest(leg1Items);
     const best2 = pickBest(leg2Items);
 
-    const lines1 = best1.map((item, i) => {
-      const seg = item.journeys?.[0]?.segments?.[0];
-      if (!seg) return '';
-      const no = seg.marketingTransportNo || '';
-      const dep = seg.depDateTime || '';
-      const arr = seg.arrDateTime || '';
-      const depSt = seg.depStationShortName || seg.depStationName || '';
-      const arrSt = seg.arrStationShortName || seg.arrStationName || '';
-      const dur = seg.duration ? `${Math.floor(seg.duration / 60)}h${seg.duration % 60}m` : '';
-      const seat = seg.seatClassName || '';
-      const price = item.ticketPrice || item.price || '';
-      return { text: `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`, arrStation: arrSt };
-    }).filter(x => x.text);
+    // 计算该枢纽的评分：高铁数量 + 站名匹配度
+    const hs1 = best1.filter(it => isHighSpeed(it.journeys?.[0]?.segments?.[0]?.marketingTransportNo || '')).length;
+    const hs2 = best2.filter(it => isHighSpeed(it.journeys?.[0]?.segments?.[0]?.marketingTransportNo || '')).length;
+    const leg1Arr = best1[0]?.journeys?.[0]?.segments?.[0]?.arrStationShortName || best1[0]?.journeys?.[0]?.segments?.[0]?.arrStationName || '';
+    const leg2Dep = best2[0]?.journeys?.[0]?.segments?.[0]?.depStationShortName || best2[0]?.journeys?.[0]?.segments?.[0]?.depStationName || '';
+    const stationMatch = (leg1Arr === leg2Dep) ? 10 : 0;
+    const score = hs1 + hs2 + stationMatch;
 
-    const lines2 = best2.map((item, i) => {
-      const seg = item.journeys?.[0]?.segments?.[0];
-      if (!seg) return '';
-      const no = seg.marketingTransportNo || '';
-      const dep = seg.depDateTime || '';
-      const arr = seg.arrDateTime || '';
-      const depSt = seg.depStationShortName || seg.depStationName || '';
-      const arrSt = seg.arrStationShortName || seg.arrStationName || '';
-      const dur = seg.duration ? `${Math.floor(seg.duration / 60)}h${seg.duration % 60}m` : '';
-      const seat = seg.seatClassName || '';
-      const price = item.ticketPrice || item.price || '';
-      return { text: `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`, depStation: depSt };
-    }).filter(x => x.text);
+    return { hub, best1, best2, score, leg1Arr, leg2Dep };
+  }));
 
-    // 检测站名不匹配：第一程到达站 vs 第二程出发站
+  // 取评分最高的有效方案
+  const validResults = results
+    .map(r => r.status === 'fulfilled' ? r.value : null)
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  if (validResults.length === 0) return null;
+
+  const formatLeg = (items, i) => {
+    const seg = items[i]?.journeys?.[0]?.segments?.[0];
+    if (!seg) return null;
+    const no = seg.marketingTransportNo || '';
+    const dep = seg.depDateTime || '';
+    const arr = seg.arrDateTime || '';
+    const depSt = seg.depStationShortName || seg.depStationName || '';
+    const arrSt = seg.arrStationShortName || seg.arrStationName || '';
+    const dur = seg.duration ? `${Math.floor(seg.duration / 60)}h${seg.duration % 60}m` : '';
+    const seat = seg.seatClassName || '';
+    const price = items[i].ticketPrice || items[i].price || '';
+    return { text: `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`, arrStation: arrSt, depStation: depSt };
+  };
+
+  const parts = [];
+  for (const plan of validResults) {
+    const lines1 = plan.best1.map((_, i) => formatLeg(plan.best1, i)).filter(Boolean);
+    const lines2 = plan.best2.map((_, i) => formatLeg(plan.best2, i)).filter(Boolean);
+    if (lines1.length === 0 || lines2.length === 0) continue;
+
     const warnings = [];
-    const leg1Arr = lines1[0]?.arrStation || '';
-    const leg2Dep = lines2[0]?.depStation || '';
-    if (leg1Arr && leg2Dep && leg1Arr !== leg2Dep) {
-      warnings.push(`⚠️ 第一程到${leg1Arr}，第二程从${leg2Dep}出发，需换乘地铁/打车（约30-40分钟），请预留转车时间`);
+    if (plan.leg1Arr && plan.leg2Dep && plan.leg1Arr !== plan.leg2Dep) {
+      warnings.push(`⚠️ 第一程到${plan.leg1Arr}，第二程从${plan.leg2Dep}出发，需换乘地铁/打车（约30-40分钟），请预留转车时间`);
     }
-
     const warnText = warnings.length > 0 ? '\n\n' + warnings.join('\n') : '';
-    return `🔄 中转方案（经${hub}）：\n\n第一段 ${origin}→${hub}：\n${lines1.map(x=>x.text).join('\n')}\n\n第二段 ${hub}→${destination}：\n${lines2.map(x=>x.text).join('\n')}${warnText}\n\n💡 建议：选第一段尽早到达的车次，留出换乘时间，再接第二段出发的车次`;
-  } catch {
-    return null;
+    parts.push(`🔄 中转方案（经${plan.hub}）：\n\n第一段 ${origin}→${plan.hub}：\n${lines1.map(x=>x.text).join('\n')}\n\n第二段 ${plan.hub}→${destination}：\n${lines2.map(x=>x.text).join('\n')}${warnText}`);
   }
+
+  if (parts.length === 0) return null;
+  return parts.join('\n\n') + '\n\n💡 建议：选第一段尽早到达的车次，留出换乘时间，再接第二段出发的车次';
 }
 
 // 格式化景点
