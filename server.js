@@ -96,7 +96,8 @@ function extractCities(message) {
     const o = CITIES.find(c => routeMatch[1].includes(c));
     const d = CITIES.find(c => routeMatch[2].includes(c));
     if (o && d) return { origin: o, destination: d };
-    if (routeMatch[1].length >= 2 && routeMatch[2].length >= 2) {
+    // raw text fallback 只在完全匹配城市名时使用
+    if (CITIES.includes(routeMatch[1]) && CITIES.includes(routeMatch[2])) {
       return { origin: routeMatch[1], destination: routeMatch[2] };
     }
   }
@@ -177,7 +178,7 @@ function extractDepHourRange(message) {
   const nightMatch = message.match(/红眼|深夜|凌晨/);
   if (earlyMatch) return { start: 6, end: 12 };
   if (lateMatch) return { start: 12, end: 20 };
-  if (nightMatch) return { start: 20, end: 6 };
+  if (nightMatch) return { start: 20, end: 24 };
   // "8点之前出发"
   const beforeMatch = message.match(/(\d+)\s*点\s*(?:之前|以前|前)\s*(?:出发|走|飞)/);
   if (beforeMatch) return { start: 0, end: parseInt(beforeMatch[1]) };
@@ -210,7 +211,8 @@ function resolveDate(message) {
   const now = new Date();
   const cn = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
   const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
-  if (message.includes('后天')) today.setDate(today.getDate() + 2);
+  if (message.includes('大后天')) today.setDate(today.getDate() + 3);
+  else if (message.includes('后天')) today.setDate(today.getDate() + 2);
   else if (message.includes('明天')) today.setDate(today.getDate() + 1);
   else if (message.includes('今天') || message.includes('今日')) { /* today */ }
   else {
@@ -237,7 +239,7 @@ function resolveDate(message) {
 
 function parseIntent(message) {
   const hotelKw = ['酒店', '住宿', '宾馆', '民宿', '住哪', '客栈'];
-  const flightKw = ['机票', '航班', '飞机', '航班号'];
+  const flightKw = ['机票', '航班', '飞机', '航班号', '直飞', '飞'];
   const trainKw = ['火车', '高铁', '动车', '火车票', '高铁票'];
   const poiKw = ['景点', '好玩', '旅游', '玩什么', '打卡', '必去', '推荐去'];
 
@@ -552,6 +554,17 @@ app.post('/api/chat', async (req, res) => {
           depHourRange: parsed.depHourRange,
         });
         reply = formatFlights(data, parsed.origin, parsed.destination);
+        // 远期日期数据不全提示
+        if (parsed.date) {
+          const cn = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+          const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
+          const depDate = new Date(parsed.date);
+          const daysDiff = Math.round((depDate - today) / 86400000);
+          const flightItems = data?.data?.itemList || [];
+          if (daysDiff > 7 && flightItems.length <= 2) {
+            reply += '\n\n⚠️ 查询日期较远，飞猪数据可能不全，建议去携程/飞猪APP确认完整航班和价格';
+          }
+        }
         break;
       }
       case 'train': {
@@ -576,6 +589,18 @@ app.post('/api/chat', async (req, res) => {
           }
         }
         if (!reply) reply = `未找到${parsed.origin || ''}→${parsed.destination || ''}的火车票信息`;
+        // 远期日期数据不全提示
+        if (parsed.date) {
+          const cn = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+          const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
+          const depDate = new Date(parsed.date);
+          const daysDiff = Math.round((depDate - today) / 86400000);
+          if (daysDiff > 7 && items.length <= 2) {
+            reply += '\n\n⚠️ 查询日期较远，飞猪数据可能不全，建议去 12306 APP 确认完整车次和余票';
+          } else if (items.length === 0) {
+            reply += '\n\n⚠️ 该日期暂无数据，可能尚未开售或已售罄，建议去 12306 APP 确认';
+          }
+        }
         break;
       }
       case 'poi': {
