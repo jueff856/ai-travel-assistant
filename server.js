@@ -12,7 +12,8 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // FlyAI MCP 配置
 const MCP_URL = process.env.FLYAI_MCP_URL || 'https://flyai.open.fliggy.com/mcp';
-const API_KEY = process.env.FLYAI_API_KEY || process.env.FLIGGY_API_KEY || '';
+// 优先用户配置的 Key，否则用体验模式内置 Key（每天100次免费）
+const API_KEY = process.env.FLYAI_API_KEY || process.env.FLIGGY_API_KEY || 'sk-faRn8Kp2QzXvLm9YtA4EjHcWbS7oUdG5iF3xNqV6rZ';
 const SIGN_SECRET = process.env.FLYAI_SIGN_SECRET || 'XSbdYnucPARDc9knhD8+X6hxdD1Nh6ZGI6Hadg25kBw=';
 
 function sha256(str) {
