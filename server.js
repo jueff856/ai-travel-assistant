@@ -211,24 +211,78 @@ function resolveDate(message) {
   const now = new Date();
   const cn = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
   const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
+  const currentYear = today.getFullYear();
+
+  // 相对天数
   if (message.includes('大后天')) today.setDate(today.getDate() + 3);
   else if (message.includes('后天')) today.setDate(today.getDate() + 2);
   else if (message.includes('明天')) today.setDate(today.getDate() + 1);
   else if (message.includes('今天') || message.includes('今日')) { /* today */ }
   else {
-    // 解析"这周六""下周一"等星期表达
+    // "下下周一"等双重前缀
+    const doubleWeekMatch = message.match(/下下周(日|天|一|二|三|四|五|六)/);
+    // "下周一"等星期表达
     const weekMap = { '日': 0, '天': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6 };
-    const weekMatch = message.match(/(这|下|本)?周(日|天|一|二|三|四|五|六)/);
-    if (weekMatch) {
-      const targetDay = weekMap[weekMatch[2]];
-      const isNext = weekMatch[1] === '下';
+    if (doubleWeekMatch) {
+      const targetDay = weekMap[doubleWeekMatch[1]];
       const currentDay = today.getDay();
-      let diff = targetDay - currentDay;
-      if (isNext) diff += 7;
-      else if (diff <= 0) diff += 7;
+      let diff = targetDay - currentDay + 14;
+      if (diff < 7) diff += 7;
       today.setDate(today.getDate() + diff);
     } else {
-      return null;
+      const weekMatch = message.match(/(这|下|本)?周(日|天|一|二|三|四|五|六)/);
+      if (weekMatch) {
+        const targetDay = weekMap[weekMatch[2]];
+        const isNext = weekMatch[1] === '下';
+        const currentDay = today.getDay();
+        let diff = targetDay - currentDay;
+        if (isNext) diff += 7;
+        else if (diff <= 0) diff += 7;
+        today.setDate(today.getDate() + diff);
+      } else {
+        // 节假日
+        const holidays = {
+          '元旦': { month: 1, day: 1 },
+          '清明': { month: 4, day: 5 },
+          '劳动节': { month: 5, day: 1 },
+          '五一': { month: 5, day: 1 },
+          '端午': { month: 5, day: 31 },
+          '中秋': { month: 10, day: 6 },
+          '国庆': { month: 10, day: 1 },
+          '春节': { month: 1, day: 29 },
+        };
+        // 2026年固定日期（春节/端午/中秋每年不同，需更新）
+        const holiday2026 = {
+          '元旦': '2026-01-01', '春节': '2026-02-17', '清明': '2026-04-05',
+          '劳动节': '2026-05-01', '五一': '2026-05-01', '端午': '2026-05-31',
+          '中秋': '2026-10-06', '国庆': '2026-10-01',
+        };
+        let matched = false;
+        for (const [name, dateStr] of Object.entries(holiday2026)) {
+          if (message.includes(name)) {
+            const [y, m, d] = dateStr.split('-').map(Number);
+            const hDate = new Date(y, m - 1, d);
+            // 如果节日已过，跳到明年（简化处理）
+            if (hDate < today && name !== '元旦') continue;
+            today.setTime(hDate.getTime());
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          // "下个月X号"
+          const nextMonthMatch = message.match(/下个?月(\d{1,2})[号日]/);
+          if (nextMonthMatch) {
+            const day = parseInt(nextMonthMatch[1]);
+            let m = today.getMonth() + 2; // 下个月
+            let y = today.getFullYear();
+            if (m > 12) { m -= 12; y++; }
+            today.setTime(new Date(y, m - 1, day).getTime());
+          } else {
+            return null;
+          }
+        }
+      }
     }
   }
   const y = today.getFullYear();
@@ -520,6 +574,19 @@ function formatAiResult(data) {
   return JSON.stringify(data, null, 2);
 }
 
+const fs = require('fs');
+
+// 埋点日志
+const LOG_FILE = path.join(__dirname, 'query_log.json');
+function logQuery(entry) {
+  try {
+    const logs = fs.existsSync(LOG_FILE) ? JSON.parse(fs.readFileSync(LOG_FILE, 'utf8')) : [];
+    logs.push(entry);
+    if (logs.length > 1000) logs.splice(0, logs.length - 1000);
+    fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
+  } catch {}
+}
+
 // 聊天接口
 app.post('/api/chat', async (req, res) => {
   const { message } = req.body;
@@ -613,6 +680,19 @@ app.post('/api/chat', async (req, res) => {
         reply = formatAiResult(data);
       }
     }
+
+    // 埋点记录
+    logQuery({
+      timestamp: new Date().toISOString(),
+      input: message,
+      intent: parsed.intent,
+      origin: parsed.origin,
+      destination: parsed.destination,
+      date: parsed.date,
+      result_count: (reply.match(/^\d+\./gm) || []).length,
+      has_link: reply.includes('feizhu.com') || reply.includes('fliggy.com'),
+      asked_back: false,
+    });
 
     res.json({ reply });
   } catch (err) {
