@@ -347,11 +347,34 @@ function formatFlights(data, origin, destination) {
   return `为您找到${label}的航班：\n\n${lines}`;
 }
 
-// 格式化火车票
+// 中转枢纽站（按区域分组）
+const TRANSFER_HUBS = {
+  '广州南': ['南宁东','长沙南','贵阳北','武汉','昆明南'],
+  '南宁东': ['广州南','昆明南','贵阳北','长沙南'],
+  '长沙南': ['广州南','武汉','南昌西','贵阳北','南宁东'],
+  '武汉': ['广州南','长沙南','郑州东','合肥南'],
+  '贵阳北': ['广州南','南宁东','昆明南','长沙南'],
+  '昆明南': ['南宁东','贵阳北','广州南','长沙南'],
+};
+
+// 判断车次是否为动车/高铁
+function isHighSpeed(trainNo) {
+  return /^[DGCC]/.test(trainNo);
+}
+
+// 格式化火车票（动车/高铁优先排序）
 function formatTrains(data, origin, destination) {
   const items = data?.data?.itemList;
-  if (!items || items.length === 0) return `未找到火车票信息`;
-  const top = items.slice(0, 5);
+  if (!items || items.length === 0) return null;
+  // 排序：动车/高铁排前，普快排后
+  const sorted = [...items].sort((a, b) => {
+    const aNo = a.journeys?.[0]?.segments?.[0]?.marketingTransportNo || '';
+    const bNo = b.journeys?.[0]?.segments?.[0]?.marketingTransportNo || '';
+    const aHS = isHighSpeed(aNo) ? 0 : 1;
+    const bHS = isHighSpeed(bNo) ? 0 : 1;
+    return aHS - bHS;
+  });
+  const top = sorted.slice(0, 5);
   const lines = top.map((item, i) => {
     const seg = item.journeys?.[0]?.segments?.[0];
     if (!seg) return '';
@@ -366,10 +389,87 @@ function formatTrains(data, origin, destination) {
     const price = item.ticketPrice || item.price || '';
     const link = item.jumpUrl || '';
     const dateStr = dep.slice(0, 10);
-    return `${i + 1}. ${no} (${type})\n   📅 ${dateStr}  🕐 ${dep.slice(11, 16)} ${depStation} → ${arr.slice(11, 16)} ${arrStation} | ⏱ ${duration}\n   💺 ${seat} | 💰 ¥${price}\n   🔗 ${link}`;
+    const tag = isHighSpeed(no) ? '' : ' [普快]';
+    return `${i + 1}. ${no} (${type})${tag}\n   📅 ${dateStr}  🕐 ${dep.slice(11, 16)} ${depStation} → ${arr.slice(11, 16)} ${arrStation} | ⏱ ${duration}\n   💺 ${seat} | 💰 ¥${price}\n   🔗 ${link}`;
   }).filter(Boolean).join('\n\n');
   const label = origin ? `${origin}→${destination}` : destination;
   return `为您找到${label}的火车票：\n\n${lines}`;
+}
+
+// 查找中转方案
+async function searchTransferTrains(origin, destination, date) {
+  // 找出同时连接 origin 和 destination 的枢纽站
+  const hubCandidates = Object.entries(TRANSFER_HUBS).filter(([hub, connects]) => {
+    // 枢纽站本身不能是出发或到达
+    if (hub === origin || hub === destination) return false;
+    // 枢纽站应该能到达目的地（简化：只要在连接列表或目的地本身是枢纽）
+    return true;
+  }).map(([hub]) => hub);
+
+  // 优先选距离出发地较近的枢纽（广州南对广西/湖南，南宁东对广西）
+  const priorityHubs = ['广州南', '南宁东', '长沙南', '武汉', '贵阳北', '昆明南'];
+  const hubs = priorityHubs.filter(h => hubCandidates.includes(h));
+  if (hubs.length === 0) return null;
+
+  // 只查第一个枢纽的中转方案（避免太多并发请求）
+  const hub = hubs[0];
+  try {
+    const [leg1, leg2] = await Promise.all([
+      searchTrains(origin, hub, date),
+      searchTrains(hub, destination, date),
+    ]);
+    const leg1Items = leg1?.data?.itemList || [];
+    const leg2Items = leg2?.data?.itemList || [];
+    if (leg1Items.length === 0 || leg2Items.length === 0) return null;
+
+    // 从每段取最优的动车/高铁（按车次号去重）
+    const pickBest = (items) => {
+      const hs = items.filter(it => isHighSpeed(it.journeys?.[0]?.segments?.[0]?.marketingTransportNo || ''));
+      const pool = hs.length > 0 ? hs : items;
+      const seen = new Set();
+      const unique = pool.filter(it => {
+        const no = it.journeys?.[0]?.segments?.[0]?.marketingTransportNo || '';
+        if (seen.has(no)) return false;
+        seen.add(no);
+        return true;
+      });
+      return unique.slice(0, 3);
+    };
+    const best1 = pickBest(leg1Items);
+    const best2 = pickBest(leg2Items);
+
+    const lines1 = best1.map((item, i) => {
+      const seg = item.journeys?.[0]?.segments?.[0];
+      if (!seg) return '';
+      const no = seg.marketingTransportNo || '';
+      const dep = seg.depDateTime || '';
+      const arr = seg.arrDateTime || '';
+      const depSt = seg.depStationShortName || seg.depStationName || '';
+      const arrSt = seg.arrStationShortName || seg.arrStationName || '';
+      const dur = seg.duration ? `${Math.floor(seg.duration / 60)}h${seg.duration % 60}m` : '';
+      const seat = seg.seatClassName || '';
+      const price = item.ticketPrice || item.price || '';
+      return `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`;
+    }).filter(Boolean).join('\n');
+
+    const lines2 = best2.map((item, i) => {
+      const seg = item.journeys?.[0]?.segments?.[0];
+      if (!seg) return '';
+      const no = seg.marketingTransportNo || '';
+      const dep = seg.depDateTime || '';
+      const arr = seg.arrDateTime || '';
+      const depSt = seg.depStationShortName || seg.depStationName || '';
+      const arrSt = seg.arrStationShortName || seg.arrStationName || '';
+      const dur = seg.duration ? `${Math.floor(seg.duration / 60)}h${seg.duration % 60}m` : '';
+      const seat = seg.seatClassName || '';
+      const price = item.ticketPrice || item.price || '';
+      return `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`;
+    }).filter(Boolean).join('\n');
+
+    return `🔄 中转方案（经${hub}）：\n\n第一段 ${origin}→${hub}：\n${lines1}\n\n第二段 ${hub}→${destination}：\n${lines2}\n\n💡 建议：选第一段上午到达${hub}的车次，换乘第二段下午出发的车次`;
+  } catch {
+    return null;
+  }
 }
 
 // 格式化景点
@@ -442,6 +542,16 @@ app.post('/api/chat', async (req, res) => {
           maxPrice: parsed.maxPrice,
         });
         reply = formatTrains(data, parsed.origin, parsed.destination);
+        // 判断是否需要推荐中转：直达结果为空，或全是普快
+        const items = data?.data?.itemList || [];
+        const hasHighSpeed = items.some(it => isHighSpeed(it.journeys?.[0]?.segments?.[0]?.marketingTransportNo || ''));
+        if (!reply || items.length === 0 || !hasHighSpeed) {
+          const transfer = await searchTransferTrains(parsed.origin, parsed.destination, parsed.date);
+          if (transfer) {
+            reply = reply ? `${reply}\n\n${transfer}` : transfer;
+          }
+        }
+        if (!reply) reply = `未找到${parsed.origin || ''}→${parsed.destination || ''}的火车票信息`;
         break;
       }
       case 'poi': {
