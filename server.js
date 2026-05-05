@@ -623,6 +623,19 @@ function logQuery(entry) {
   } catch {}
 }
 
+// 复合意图检测：一句话含交通+酒店/景点
+function detectCompoundIntent(message) {
+  const hasTransport = /机票|航班|飞机|直飞|飞|火车|高铁|动车/.test(message);
+  const hasHotel = /酒店|住宿|宾馆|民宿|住哪|客栈/.test(message);
+  const hasPoi = /景点|好玩|必去/.test(message);
+
+  const tasks = [];
+  if (hasTransport) tasks.push('transport');
+  if (hasHotel) tasks.push('hotel');
+  if (hasPoi) tasks.push('poi');
+  return tasks.length >= 2 ? tasks : null;
+}
+
 // 聊天接口
 app.post('/api/chat', async (req, res) => {
   const { message } = req.body;
@@ -652,6 +665,76 @@ app.post('/api/chat', async (req, res) => {
         ask_field: ab.field,
       });
       return res.json({ reply, askBack: ab });
+    }
+
+    // 复合意图拆解：一句话含交通+酒店/景点
+    const compoundTasks = detectCompoundIntent(message);
+    if (compoundTasks) {
+      const results = [];
+      const dest = parsed.destination;
+      const orig = parsed.origin;
+      const dt = parsed.date;
+
+      for (const task of compoundTasks) {
+        try {
+          if (task === 'transport') {
+            // 判断是机票还是火车
+            const isFlight = /机票|航班|飞机|直飞|飞/.test(message) && !/火车|高铁|动车/.test(message);
+            const isTrain = /火车|高铁|动车/.test(message) && !/机票|航班|飞机|直飞|飞/.test(message);
+            if (isFlight) {
+              const data = await searchFlights(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType, flightSort: parsed.flightSort, depHourRange: parsed.depHourRange });
+              results.push({ type: 'flight', label: '✈️ 机票', content: formatFlights(data, orig, dest) });
+            } else if (isTrain) {
+              const data = await searchTrains(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType });
+              let trainReply = formatTrains(data, orig, dest);
+              const items = data?.data?.itemList || [];
+              const hasDirectToDest = items.some(it => {
+                const seg = it.journeys?.[0]?.segments?.[0];
+                if (!seg) return false;
+                return (seg.arrStationShortName || seg.arrStationName || '').includes(dest || '');
+              });
+              if (!trainReply || items.length === 0 || !hasDirectToDest) {
+                const transfer = await searchTransferTrains(orig, dest, dt);
+                if (transfer) trainReply = trainReply ? `${trainReply}\n\n${transfer}` : transfer;
+              }
+              if (!trainReply) trainReply = `未找到${orig || ''}→${dest || ''}的火车票信息`;
+              results.push({ type: 'train', label: '🚄 火车票', content: trainReply });
+            } else {
+              // 都有或都不明确，两个都查
+              const [fData, tData] = await Promise.all([
+                searchFlights(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType }),
+                searchTrains(orig, dest, dt, { seatClass: parsed.seatClass }),
+              ]);
+              results.push({ type: 'flight', label: '✈️ 机票', content: formatFlights(fData, orig, dest) });
+              let trainReply = formatTrains(tData, orig, dest);
+              if (!trainReply) trainReply = `未找到火车票信息`;
+              results.push({ type: 'train', label: '🚄 火车票', content: trainReply });
+            }
+          } else if (task === 'hotel') {
+            const data = await searchHotels(dest, dt, { poi: parsed.poi, maxPrice: parsed.maxPrice, hotelType: parsed.hotelType, stars: parsed.stars, bedType: parsed.bedType, checkOutDate: parsed.checkOutDate, sort: parsed.sort });
+            results.push({ type: 'hotel', label: '🏨 酒店', content: formatHotels(data, dest) });
+          } else if (task === 'poi') {
+            const data = await searchPoi(dest, parsed.poi);
+            results.push({ type: 'poi', label: '🎯 景点', content: formatPoi(data, dest) });
+          }
+        } catch (err) {
+          results.push({ type: task, label: task === 'hotel' ? '🏨 酒店' : task === 'poi' ? '🎯 景点' : '🚄 交通', content: `查询失败：${err.message}` });
+        }
+      }
+
+      reply = results.map(r => `${r.label}\n${'─'.repeat(20)}\n${r.content}`).join('\n\n');
+      logQuery({
+        timestamp: new Date().toISOString(),
+        input: message,
+        intent: 'compound:' + compoundTasks.join('+'),
+        origin: orig,
+        destination: dest,
+        date: dt,
+        result_count: results.length,
+        has_link: reply.includes('feizhu.com') || reply.includes('fliggy.com'),
+        asked_back: false,
+      });
+      return res.json({ reply });
     }
 
     switch (parsed.intent) {
