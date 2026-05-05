@@ -325,8 +325,44 @@ function parseIntent(message) {
     checkOutDate = d.toISOString().slice(0, 10);
   }
 
+  // 追问决策
+  const askBack = checkAskBack(message, intent, origin, destination, date);
+
   return { intent, origin, destination, poi, date, maxPrice, hotelType, stars, bedType,
-    nights, checkOutDate, seatClass, journeyType, depHourRange, sort, flightSort };
+    nights, checkOutDate, seatClass, journeyType, depHourRange, sort, flightSort, askBack };
+}
+
+// 追问决策表
+function checkAskBack(message, intent, origin, destination, date) {
+  // 有目的地但没交通方式 → 追问怎么去
+  if (destination && !origin && intent === 'general') {
+    return { field: 'origin_and_transport', question: `去${destination}怎么走？`, options: ['飞过去', '坐高铁', '查酒店', '看景点'] };
+  }
+
+  // general 意图且没有明确目的地 → 走 aiSearch
+  if (intent === 'general') return null;
+
+  // 酒店不需要出发地，只需要目的地
+  if (intent === 'hotel') {
+    if (!destination) {
+      return { field: 'destination', question: '想去哪个城市住？', options: ['杭州', '上海', '三亚', '北京'] };
+    }
+    return null;
+  }
+
+  // 机票/火车票/景点：需要出发地+目的地
+  if (!origin && !destination) {
+    return { field: 'both', question: '从哪出发？去哪？', options: ['上海→北京', '广州→成都', '北京→三亚', '杭州→厦门'] };
+  }
+  if (!origin) {
+    const fromOptions = ['上海', '北京', '广州', '深圳'];
+    return { field: 'origin', question: `从哪里出发去${destination}？`, options: fromOptions };
+  }
+  if (!destination) {
+    return { field: 'destination', question: `从${origin}去哪？`, options: ['北京', '上海', '杭州', '成都'] };
+  }
+
+  return null;
 }
 
 // 搜索函数
@@ -597,6 +633,26 @@ app.post('/api/chat', async (req, res) => {
   try {
     const parsed = parseIntent(message);
     let reply;
+
+    // 追问机制：信息缺失时优先反问
+    if (parsed.askBack) {
+      const ab = parsed.askBack;
+      const options = ab.options.map(o => `[${o}]`).join('  ');
+      reply = `${ab.question}\n${options}\n\n直接告诉我城市名也行 👆`;
+      logQuery({
+        timestamp: new Date().toISOString(),
+        input: message,
+        intent: parsed.intent,
+        origin: parsed.origin,
+        destination: parsed.destination,
+        date: parsed.date,
+        result_count: 0,
+        has_link: false,
+        asked_back: true,
+        ask_field: ab.field,
+      });
+      return res.json({ reply, askBack: ab });
+    }
 
     switch (parsed.intent) {
       case 'hotel': {

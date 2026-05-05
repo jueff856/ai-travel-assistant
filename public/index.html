@@ -158,6 +158,13 @@
       0%, 80%, 100% { transform: scale(0); }
       40% { transform: scale(1); }
     }
+    .ask-options { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+    .ask-btn {
+      background: #fff; border: 1px solid #ff6a00; color: #ff6a00;
+      padding: 4px 12px; border-radius: 14px; cursor: pointer; font-size: 13px;
+      transition: all 0.2s;
+    }
+    .ask-btn:hover { background: #ff6a00; color: #fff; }
   </style>
 </head>
 <body>
@@ -192,12 +199,12 @@
       }
     });
 
-    async function sendMessage() {
-      const text = input.value.trim();
+    async function sendMessage(overrideText) {
+      const text = overrideText || input.value.trim();
       if (!text) return;
 
-      // 用户消息
-      appendMessage('user', text);
+      // 用户消息（按钮触发时不重复添加）
+      if (!overrideText) appendMessage('user', text);
       input.value = '';
       sendBtn.disabled = true;
 
@@ -212,7 +219,7 @@
         });
         const data = await res.json();
         typingEl.remove();
-        appendMessage('bot', data.reply);
+        appendMessage('bot', data.reply, data.askBack);
       } catch {
         typingEl.remove();
         appendMessage('bot', '网络错误，请稍后重试');
@@ -222,15 +229,34 @@
       input.focus();
     }
 
-    function appendMessage(role, text) {
+    function appendMessage(role, text, askBack) {
       const div = document.createElement('div');
       div.className = `message ${role}`;
+      let bubbleContent;
+      if (role === 'bot') {
+        bubbleContent = escapeHtml(text);
+        // 追问按钮
+        if (askBack && askBack.options) {
+          const btns = askBack.options.map(o =>
+            `<button class="ask-btn" onclick="sendAsk(this)">${escapeHtml(o)}</button>`
+          ).join(' ');
+          bubbleContent += `<div class="ask-options">${btns}</div>`;
+        }
+      } else {
+        bubbleContent = escapeHtml(text);
+      }
       div.innerHTML = `
         <div class="avatar">${role === 'bot' ? '🤖' : '👤'}</div>
-        <div class="bubble">${escapeHtml(text)}</div>
+        <div class="bubble">${bubbleContent}</div>
       `;
       messages.appendChild(div);
       messages.scrollTop = messages.scrollHeight;
+    }
+
+    function sendAsk(btn) {
+      const text = btn.textContent;
+      appendMessage('user', text);
+      sendMessage(text);
     }
 
     function appendTyping() {
