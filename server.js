@@ -206,12 +206,33 @@ function extractFlightSort(message) {
 function resolveDate(message) {
   const absMatch = message.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
   if (absMatch) return absMatch[1].replace(/\//g, '-');
-  const today = new Date();
+  // 用中国时区计算
+  const now = new Date();
+  const cn = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+  const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
   if (message.includes('后天')) today.setDate(today.getDate() + 2);
   else if (message.includes('明天')) today.setDate(today.getDate() + 1);
   else if (message.includes('今天') || message.includes('今日')) { /* today */ }
-  else return null;
-  return today.toISOString().slice(0, 10);
+  else {
+    // 解析"这周六""下周一"等星期表达
+    const weekMap = { '日': 0, '天': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6 };
+    const weekMatch = message.match(/(这|下|本)?周(日|天|一|二|三|四|五|六)/);
+    if (weekMatch) {
+      const targetDay = weekMap[weekMatch[2]];
+      const isNext = weekMatch[1] === '下';
+      const currentDay = today.getDay();
+      let diff = targetDay - currentDay;
+      if (isNext) diff += 7;
+      else if (diff <= 0) diff += 7;
+      today.setDate(today.getDate() + diff);
+    } else {
+      return null;
+    }
+  }
+  const y = today.getFullYear();
+  const m = String(today.getMonth() + 1).padStart(2, '0');
+  const d = String(today.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
 function parseIntent(message) {
@@ -449,8 +470,8 @@ async function searchTransferTrains(origin, destination, date) {
       const dur = seg.duration ? `${Math.floor(seg.duration / 60)}h${seg.duration % 60}m` : '';
       const seat = seg.seatClassName || '';
       const price = item.ticketPrice || item.price || '';
-      return `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`;
-    }).filter(Boolean).join('\n');
+      return { text: `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`, arrStation: arrSt };
+    }).filter(x => x.text);
 
     const lines2 = best2.map((item, i) => {
       const seg = item.journeys?.[0]?.segments?.[0];
@@ -463,10 +484,19 @@ async function searchTransferTrains(origin, destination, date) {
       const dur = seg.duration ? `${Math.floor(seg.duration / 60)}h${seg.duration % 60}m` : '';
       const seat = seg.seatClassName || '';
       const price = item.ticketPrice || item.price || '';
-      return `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`;
-    }).filter(Boolean).join('\n');
+      return { text: `   ${i + 1}) ${no} ${dep.slice(11,16)} ${depSt}→${arr.slice(11,16)} ${arrSt} | ⏱${dur} | 💺${seat} | ¥${price}`, depStation: depSt };
+    }).filter(x => x.text);
 
-    return `🔄 中转方案（经${hub}）：\n\n第一段 ${origin}→${hub}：\n${lines1}\n\n第二段 ${hub}→${destination}：\n${lines2}\n\n💡 建议：选第一段上午到达${hub}的车次，换乘第二段下午出发的车次`;
+    // 检测站名不匹配：第一程到达站 vs 第二程出发站
+    const warnings = [];
+    const leg1Arr = lines1[0]?.arrStation || '';
+    const leg2Dep = lines2[0]?.depStation || '';
+    if (leg1Arr && leg2Dep && leg1Arr !== leg2Dep) {
+      warnings.push(`⚠️ 第一程到${leg1Arr}，第二程从${leg2Dep}出发，需换乘地铁/打车（约30-40分钟），请预留转车时间`);
+    }
+
+    const warnText = warnings.length > 0 ? '\n\n' + warnings.join('\n') : '';
+    return `🔄 中转方案（经${hub}）：\n\n第一段 ${origin}→${hub}：\n${lines1.map(x=>x.text).join('\n')}\n\n第二段 ${hub}→${destination}：\n${lines2.map(x=>x.text).join('\n')}${warnText}\n\n💡 建议：选第一段尽早到达的车次，留出换乘时间，再接第二段出发的车次`;
   } catch {
     return null;
   }
@@ -542,10 +572,15 @@ app.post('/api/chat', async (req, res) => {
           maxPrice: parsed.maxPrice,
         });
         reply = formatTrains(data, parsed.origin, parsed.destination);
-        // 判断是否需要推荐中转：直达结果为空，或全是普快
+        // 判断是否需要推荐中转：直达结果为空，或没有真正到达目的地的车次
         const items = data?.data?.itemList || [];
-        const hasHighSpeed = items.some(it => isHighSpeed(it.journeys?.[0]?.segments?.[0]?.marketingTransportNo || ''));
-        if (!reply || items.length === 0 || !hasHighSpeed) {
+        const hasDirectToDest = items.some(it => {
+          const seg = it.journeys?.[0]?.segments?.[0];
+          if (!seg) return false;
+          const arrSt = (seg.arrStationShortName || seg.arrStationName || '');
+          return arrSt.includes(parsed.destination || '');
+        });
+        if (!reply || items.length === 0 || !hasDirectToDest) {
           const transfer = await searchTransferTrains(parsed.origin, parsed.destination, parsed.date);
           if (transfer) {
             reply = reply ? `${reply}\n\n${transfer}` : transfer;
