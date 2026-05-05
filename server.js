@@ -79,6 +79,19 @@ async function callMCP(toolName, toolArgs) {
   return result.result || result;
 }
 
+// 地标→城市映射
+const LANDMARK_CITY = {
+  '西湖': '杭州', '外滩': '上海', '故宫': '北京', '长城': '北京', '天安门': '北京',
+  '鼓浪屿': '厦门', '洱海': '大理', '丽江古城': '丽江', '兵马俑': '西安',
+  '黄鹤楼': '武汉', '橘子洲': '长沙', '太平山': '香港', '大三巴': '澳门',
+  '亚龙湾': '三亚', '天涯海角': '三亚', '蜈支洲岛': '三亚',
+  '东方明珠': '上海', '迪士尼': '上海', '长隆': '广州', '世界之窗': '深圳',
+  '武侯祠': '成都', '宽窄巷子': '成都', '春熙路': '成都',
+  '夫子庙': '南京', '中山陵': '南京', '拙政园': '苏州',
+  '栈桥': '青岛', '漓江': '桂林', '象鼻山': '桂林',
+  '维多利亚港': '香港', '日月潭': '台北', '富士山': '东京',
+};
+
 // 常见城市列表
 const CITIES = ['北京','上海','广州','深圳','杭州','成都','重庆','武汉','西安','南京',
   '长沙','青岛','厦门','昆明','大连','三亚','海口','苏州','无锡','宁波',
@@ -91,6 +104,10 @@ const CITIES = ['北京','上海','广州','深圳','杭州','成都','重庆','
 
 function extractCities(message) {
   const found = CITIES.filter(c => message.includes(c));
+  // 地标→城市补充
+  for (const [landmark, city] of Object.entries(LANDMARK_CITY)) {
+    if (message.includes(landmark) && !found.includes(city)) found.push(city);
+  }
   const routeMatch = message.match(/([一-龥]{2,4})\s*(?:到|去|飞|→|->)\s*([一-龥]{2,4})/);
   if (routeMatch) {
     const o = CITIES.find(c => routeMatch[1].includes(c));
@@ -262,8 +279,9 @@ function resolveDate(message) {
           if (message.includes(name)) {
             const [y, m, d] = dateStr.split('-').map(Number);
             const hDate = new Date(y, m - 1, d);
-            // 如果节日已过，跳到明年（简化处理）
-            if (hDate < today && name !== '元旦') continue;
+            // 节日已过但不超过30天，仍用今年（用户可能查假期）
+            const daysPast = Math.round((today - hDate) / 86400000);
+            if (daysPast > 30) continue;
             today.setTime(hDate.getTime());
             matched = true;
             break;
@@ -337,6 +355,11 @@ function checkAskBack(message, intent, origin, destination, date) {
   // 有目的地但没交通方式 → 追问怎么去
   if (destination && !origin && intent === 'general') {
     return { field: 'origin_and_transport', question: `去${destination}怎么走？`, options: ['飞过去', '坐高铁', '查酒店', '看景点'] };
+  }
+
+  // 有出发地+目的地但没交通方式 → 追问交通类型
+  if (origin && destination && intent === 'general') {
+    return { field: 'transport_type', question: `${origin}到${destination}怎么去？`, options: ['坐高铁', '坐飞机', '都查查'] };
   }
 
   // general 意图且没有明确目的地 → 走 aiSearch
@@ -647,8 +670,8 @@ app.post('/api/chat', async (req, res) => {
     const parsed = parseIntent(message);
     let reply;
 
-    // 追问机制：信息缺失时优先反问
-    if (parsed.askBack) {
+    // 追问机制：仅单意图时优先反问；复合意图在拆解中处理
+    if (parsed.askBack && !detectCompoundIntent(message)) {
       const ab = parsed.askBack;
       const options = ab.options.map(o => `[${o}]`).join('  ');
       reply = `${ab.question}\n${options}\n\n直接告诉我城市名也行 👆`;
@@ -674,10 +697,16 @@ app.post('/api/chat', async (req, res) => {
       const dest = parsed.destination;
       const orig = parsed.origin;
       const dt = parsed.date;
+      let compoundAskBack = null;
 
       for (const task of compoundTasks) {
         try {
           if (task === 'transport') {
+            // 交通缺出发地时，跳过交通部分，追加追问
+            if (!orig) {
+              compoundAskBack = { field: 'origin', question: `从哪里出发去${dest}？`, options: ['上海', '北京', '广州', '深圳'] };
+              continue;
+            }
             // 判断是机票还是火车
             const isFlight = /机票|航班|飞机|直飞|飞/.test(message) && !/火车|高铁|动车/.test(message);
             const isTrain = /火车|高铁|动车/.test(message) && !/机票|航班|飞机|直飞|飞/.test(message);
@@ -723,6 +752,12 @@ app.post('/api/chat', async (req, res) => {
       }
 
       reply = results.map(r => `${r.label}\n${'─'.repeat(20)}\n${r.content}`).join('\n\n');
+      // 复合意图中交通缺出发地时追加追问
+      if (compoundAskBack) {
+        const ab = compoundAskBack;
+        const options = ab.options.map(o => `[${o}]`).join('  ');
+        reply += `\n\n❓ ${ab.question}\n${options}\n直接告诉我城市名也行 👆`;
+      }
       logQuery({
         timestamp: new Date().toISOString(),
         input: message,
@@ -749,6 +784,15 @@ app.post('/api/chat', async (req, res) => {
           sort: parsed.sort,
         });
         reply = formatHotels(data, parsed.destination);
+        // 日期已过提示
+        if (reply.includes('未找到') && parsed.date) {
+          const cn = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+          const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
+          const depDate = new Date(parsed.date);
+          if (depDate < today) {
+            reply += `\n\n⚠️ ${parsed.date} 已是过去日期，无法查询历史价格。试试"明天"或"下个月"的酒店？`;
+          }
+        }
         break;
       }
       case 'flight': {
