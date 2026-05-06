@@ -1,0 +1,20 @@
+{
+  "description": "中转枢纽站点配置，按区域分组",
+  "hubs": [
+    { "station": "南宁东", "region": "华南", "provinces": ["广西"], "priority": 10 },
+    { "station": "广州南", "region": "华南", "provinces": ["广东"], "priority": 9 },
+    { "station": "长沙南", "region": "华中", "provinces": ["湖南"], "priority": 8 },
+    { "station": "贵阳北", "region": "西南", "provinces": ["贵州"], "priority": 7 },
+    { "station": "武汉",   "region": "华中", "provinces": ["湖北"], "priority": 7 },
+    { "station": "昆明南", "region": "西南", "provinces": ["云南"], "priority": 6 },
+    { "station": "郑州东", "region": "华中", "provinces": ["河南"], "priority": 6 },
+    { "station": "南昌西", "region": "华东", "provinces": ["江西"], "priority": 5 },
+    { "station": "合肥南", "region": "华东", "provinces": ["安徽"], "priority": 5 },
+    { "station": "石家庄", "region": "华北", "provinces": ["河北"], "priority": 4 }
+  ],
+  "scoring": {
+    "highspeed_per_train": 2,
+    "station_name_match_bonus": 10,
+    "max_hubs_per_query": 2
+  }
+}

@@ -5,6 +5,23 @@ const crypto = require('crypto');
 const os = require('os');
 const Trace = require('./lib/trace');
 const traceLogger = require('./lib/logger');
+const RuleEngine = require('./knowledge/rules');
+const transferHubRule = require('./knowledge/scenarios/transfer-hub');
+const farDateWarnRule = require('./knowledge/scenarios/far-date-warn');
+const pastDateWarnRule = require('./knowledge/scenarios/past-date-warn');
+const redeyeFlightRule = require('./knowledge/scenarios/redeye-flight');
+const stationMismatchRule = require('./knowledge/scenarios/station-mismatch');
+const highspeedPriorityRule = require('./knowledge/scenarios/highspeed-priority');
+const landmarksData = require('./knowledge/data/landmarks.json');
+const holidaysData = require('./knowledge/data/holidays.json');
+const hubsData = require('./knowledge/data/hubs.json');
+
+// 初始化规则引擎
+const ruleEngine = new RuleEngine();
+ruleEngine.loadModules([
+  transferHubRule, farDateWarnRule, pastDateWarnRule,
+  redeyeFlightRule, stationMismatchRule, highspeedPriorityRule,
+]);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -82,17 +99,7 @@ async function callMCP(toolName, toolArgs) {
 }
 
 // 地标→城市映射
-const LANDMARK_CITY = {
-  '西湖': '杭州', '外滩': '上海', '故宫': '北京', '长城': '北京', '天安门': '北京',
-  '鼓浪屿': '厦门', '洱海': '大理', '丽江古城': '丽江', '兵马俑': '西安',
-  '黄鹤楼': '武汉', '橘子洲': '长沙', '太平山': '香港', '大三巴': '澳门',
-  '亚龙湾': '三亚', '天涯海角': '三亚', '蜈支洲岛': '三亚',
-  '东方明珠': '上海', '迪士尼': '上海', '长隆': '广州', '世界之窗': '深圳',
-  '武侯祠': '成都', '宽窄巷子': '成都', '春熙路': '成都',
-  '夫子庙': '南京', '中山陵': '南京', '拙政园': '苏州',
-  '栈桥': '青岛', '漓江': '桂林', '象鼻山': '桂林',
-  '维多利亚港': '香港', '日月潭': '台北', '富士山': '东京',
-};
+const LANDMARK_CITY = landmarksData.mappings;
 
 // 常见城市列表
 const CITIES = ['北京','上海','广州','深圳','杭州','成都','重庆','武汉','西安','南京',
@@ -259,31 +266,22 @@ function resolveDate(message) {
         else if (diff <= 0) diff += 7;
         today.setDate(today.getDate() + diff);
       } else {
-        // 节假日
-        const holidays = {
-          '元旦': { month: 1, day: 1 },
-          '清明': { month: 4, day: 5 },
-          '劳动节': { month: 5, day: 1 },
-          '五一': { month: 5, day: 1 },
-          '端午': { month: 5, day: 31 },
-          '中秋': { month: 10, day: 6 },
-          '国庆': { month: 10, day: 1 },
-          '春节': { month: 1, day: 29 },
-        };
-        // 2026年固定日期（春节/端午/中秋每年不同，需更新）
-        const holiday2026 = {
-          '元旦': '2026-01-01', '春节': '2026-02-17', '清明': '2026-04-05',
-          '劳动节': '2026-05-01', '五一': '2026-05-01', '端午': '2026-05-31',
-          '中秋': '2026-10-06', '国庆': '2026-10-01',
-        };
+        // 节假日（从 knowledge/data/holidays.json 加载）
+        const holiday2026 = {};
+        for (const h of holidaysData.holidays) {
+          const dateStr = h.dates['2026'];
+          if (dateStr) holiday2026[h.name] = `2026-${dateStr}`;
+        }
+        // 兼容别名
+        if (!holiday2026['劳动节'] && holiday2026['五一']) holiday2026['劳动节'] = holiday2026['五一'];
         let matched = false;
         for (const [name, dateStr] of Object.entries(holiday2026)) {
           if (message.includes(name)) {
             const [y, m, d] = dateStr.split('-').map(Number);
             const hDate = new Date(y, m - 1, d);
-            // 节日已过但不超过30天，仍用今年（用户可能查假期）
+            // 节日已过但不超过容忍天数，仍用今年
             const daysPast = Math.round((today - hDate) / 86400000);
-            if (daysPast > 30) continue;
+            if (daysPast > holidaysData.rules.past_days_tolerance) continue;
             today.setTime(hDate.getTime());
             matched = true;
             break;
@@ -562,8 +560,8 @@ async function searchTransferTrains(origin, destination, date) {
     const hs2 = best2.filter(it => isHighSpeed(it.journeys?.[0]?.segments?.[0]?.marketingTransportNo || '')).length;
     const leg1Arr = best1[0]?.journeys?.[0]?.segments?.[0]?.arrStationShortName || best1[0]?.journeys?.[0]?.segments?.[0]?.arrStationName || '';
     const leg2Dep = best2[0]?.journeys?.[0]?.segments?.[0]?.depStationShortName || best2[0]?.journeys?.[0]?.segments?.[0]?.depStationName || '';
-    const stationMatch = (leg1Arr === leg2Dep) ? 10 : 0;
-    const score = hs1 + hs2 + stationMatch;
+    const stationMatch = (leg1Arr === leg2Dep) ? hubsData.scoring.station_name_match_bonus : 0;
+    const score = hs1 * hubsData.scoring.highspeed_per_train + hs2 * hubsData.scoring.highspeed_per_train + stationMatch;
 
     return { hub, best1, best2, score, leg1Arr, leg2Dep };
   }));
@@ -805,15 +803,13 @@ app.post('/api/chat', async (req, res) => {
         const items = data?.data?.itemList || [];
         trace.addStep('provider_call', { provider: 'search_hotels', city: parsed.destination, date: parsed.date }, { provider: 'search_hotels', success: true, result_count: items.length }, Date.now() - t1);
         reply = formatHotels(data, parsed.destination);
-        // 日期已过提示
-        if (reply.includes('未找到') && parsed.date) {
-          const cn = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
-          const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
-          const depDate = new Date(parsed.date);
-          if (depDate < today) {
-            reply += `\n\n⚠️ ${parsed.date} 已是过去日期，无法查询历史价格。试试"明天"或"下个月"的酒店？`;
-          }
-        }
+        // 规则引擎：过期日期提示
+        const hotelEvals = ruleEngine.evaluate({
+          intent: 'hotel', date: parsed.date,
+          isPastDate: parsed.date ? new Date(parsed.date) < new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' })) : false,
+          noResults: reply.includes('未找到'),
+        });
+        reply = ruleEngine.applyActions(reply, hotelEvals);
         break;
       }
       case 'flight': {
@@ -828,17 +824,16 @@ app.post('/api/chat', async (req, res) => {
         const items = data?.data?.itemList || [];
         trace.addStep('provider_call', { provider: 'search_flight', origin: parsed.origin, destination: parsed.destination, date: parsed.date }, { provider: 'search_flight', success: true, result_count: items.length }, Date.now() - t1);
         reply = formatFlights(data, parsed.origin, parsed.destination);
-        // 远期日期数据不全提示
-        if (parsed.date) {
-          const cn = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
-          const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
-          const depDate = new Date(parsed.date);
-          const daysDiff = Math.round((depDate - today) / 86400000);
-          const flightItems = data?.data?.itemList || [];
-          if (daysDiff > 7 && flightItems.length <= 2) {
-            reply += '\n\n⚠️ 查询日期较远，飞猪数据可能不全，建议去携程/飞猪APP确认完整航班和价格';
-          }
-        }
+        // 规则引擎：远期日期警告 + 红眼航班标注
+        const cn = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+        const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
+        const daysDiff = parsed.date ? Math.round((new Date(parsed.date) - today) / 86400000) : 0;
+        const flightEvals = ruleEngine.evaluate({
+          intent: 'flight', date: parsed.date, daysDiff,
+          resultCount: (data?.data?.itemList || []).length,
+          depHourRange: parsed.depHourRange,
+        });
+        reply = ruleEngine.applyActions(reply, flightEvals);
         break;
       }
       case 'train': {
@@ -851,31 +846,29 @@ app.post('/api/chat', async (req, res) => {
         const items = data?.data?.itemList || [];
         trace.addStep('provider_call', { provider: 'search_domestic_train', origin: parsed.origin, destination: parsed.destination, date: parsed.date }, { provider: 'search_domestic_train', success: true, result_count: items.length }, Date.now() - t1);
         reply = formatTrains(data, parsed.origin, parsed.destination);
-        // 判断是否需要推荐中转：直达结果为空，或没有真正到达目的地的车次
+        // 规则引擎：中转推荐 + 远期日期警告
         const hasDirectToDest = items.some(it => {
           const seg = it.journeys?.[0]?.segments?.[0];
           if (!seg) return false;
-          const arrSt = (seg.arrStationShortName || seg.arrStationName || '');
-          return arrSt.includes(parsed.destination || '');
+          return (seg.arrStationShortName || seg.arrStationName || '').includes(parsed.destination || '');
         });
-        if (!reply || items.length === 0 || !hasDirectToDest) {
+        const trainCn = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+        const trainToday = new Date(trainCn.getFullYear(), trainCn.getMonth(), trainCn.getDate());
+        const trainDaysDiff = parsed.date ? Math.round((new Date(parsed.date) - trainToday) / 86400000) : 0;
+        const trainEvals = ruleEngine.evaluate({
+          intent: 'train', origin: parsed.origin, destination: parsed.destination,
+          date: parsed.date, daysDiff: trainDaysDiff,
+          resultCount: items.length, hasDirectToDest, trainItems: items,
+        });
+        const needsTransfer = trainEvals.some(e => e.action === 'recommend_transfer');
+        if (needsTransfer && (!reply || items.length === 0 || !hasDirectToDest)) {
           const transfer = await searchTransferTrains(parsed.origin, parsed.destination, parsed.date);
-          if (transfer) {
-            reply = reply ? `${reply}\n\n${transfer}` : transfer;
-          }
+          if (transfer) reply = reply ? `${reply}\n\n${transfer}` : transfer;
         }
         if (!reply) reply = `未找到${parsed.origin || ''}→${parsed.destination || ''}的火车票信息`;
-        // 远期日期数据不全提示
-        if (parsed.date) {
-          const cn = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
-          const today = new Date(cn.getFullYear(), cn.getMonth(), cn.getDate());
-          const depDate = new Date(parsed.date);
-          const daysDiff = Math.round((depDate - today) / 86400000);
-          if (daysDiff > 7 && items.length <= 2) {
-            reply += '\n\n⚠️ 查询日期较远，飞猪数据可能不全，建议去 12306 APP 确认完整车次和余票';
-          } else if (items.length === 0) {
-            reply += '\n\n⚠️ 该日期暂无数据，可能尚未开售或已售罄，建议去 12306 APP 确认';
-          }
+        reply = ruleEngine.applyActions(reply, trainEvals.filter(e => e.action !== 'recommend_transfer'));
+        if (items.length === 0 && parsed.date) {
+          reply += '\n\n⚠️ 该日期暂无数据，可能尚未开售或已售罄，建议去 12306 APP 确认';
         }
         break;
       }
