@@ -200,6 +200,8 @@
 
     // 追问链路：记录上一个trace_id
     let lastTraceId = null;
+    // 已确认的实体上下文，跨轮次保留
+    let confirmedContext = {};
 
     input.addEventListener('keydown', e => {
       if (e.key === 'Enter' && !e.shiftKey) {

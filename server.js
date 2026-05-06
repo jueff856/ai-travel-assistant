@@ -6,6 +6,7 @@ const os = require('os');
 const Trace = require('./lib/trace');
 const traceLogger = require('./lib/logger');
 const Orchestrator = require('./lib/orchestrator');
+const RuleEngine = require('./knowledge/rules/index');
 const transferHubRule = require('./knowledge/scenarios/transfer-hub');
 const farDateWarnRule = require('./knowledge/scenarios/far-date-warn');
 const pastDateWarnRule = require('./knowledge/scenarios/past-date-warn');
@@ -117,16 +118,37 @@ function extractCities(message) {
   for (const [landmark, city] of Object.entries(LANDMARK_CITY)) {
     if (message.includes(landmark) && !found.includes(city)) found.push(city);
   }
+
+  // "从X出发去Y" / "X出发去Y" / "X出发到Y" 模式
+  const fromMatch = message.match(/从?\s*([一-龥]{2,4})\s*出发\s*(?:去|到|飞|往)\s*([一-龥]{2,4})/);
+  if (fromMatch) {
+    const o = CITIES.find(c => fromMatch[1].includes(c));
+    const d = CITIES.find(c => fromMatch[2].includes(c));
+    if (o && d) return { origin: o, destination: d };
+  }
+
+  // "X到/去/飞Y" 路线模式
   const routeMatch = message.match(/([一-龥]{2,4})\s*(?:到|去|飞|→|->)\s*([一-龥]{2,4})/);
   if (routeMatch) {
     const o = CITIES.find(c => routeMatch[1].includes(c));
     const d = CITIES.find(c => routeMatch[2].includes(c));
     if (o && d) return { origin: o, destination: d };
-    // raw text fallback 只在完全匹配城市名时使用
     if (CITIES.includes(routeMatch[1]) && CITIES.includes(routeMatch[2])) {
       return { origin: routeMatch[1], destination: routeMatch[2] };
     }
   }
+
+  // "X出发" 标记出发地，剩余城市为目的地
+  const depOnlyMatch = message.match(/([一-龥]{2,4})\s*出发/);
+  if (depOnlyMatch) {
+    const depCity = CITIES.find(c => depOnlyMatch[1].includes(c));
+    if (depCity) {
+      const others = found.filter(c => c !== depCity);
+      if (others.length > 0) return { origin: depCity, destination: others[0] };
+      return { origin: depCity, destination: null };
+    }
+  }
+
   if (found.length >= 2) return { origin: found[0], destination: found[1] };
   if (found.length === 1) return { origin: null, destination: found[0] };
   return { origin: null, destination: null };
@@ -288,16 +310,23 @@ function resolveDate(message) {
           }
         }
         if (!matched) {
-          // "下个月X号"
-          const nextMonthMatch = message.match(/下个?月(\d{1,2})[号日]/);
-          if (nextMonthMatch) {
-            const day = parseInt(nextMonthMatch[1]);
-            let m = today.getMonth() + 2; // 下个月
-            let y = today.getFullYear();
-            if (m > 12) { m -= 12; y++; }
-            today.setTime(new Date(y, m - 1, day).getTime());
+          // "暑假" → 7月1日
+          if (/暑假/.test(message)) {
+            today.setTime(new Date(today.getFullYear(), 6, 1).getTime());
+          } else if (/寒假/.test(message)) {
+            today.setTime(new Date(today.getFullYear(), 0, 20).getTime());
           } else {
-            return null;
+            // "下个月X号"
+            const nextMonthMatch = message.match(/下个?月(\d{1,2})[号日]/);
+            if (nextMonthMatch) {
+              const day = parseInt(nextMonthMatch[1]);
+              let m = today.getMonth() + 2; // 下个月
+              let y = today.getFullYear();
+              if (m > 12) { m -= 12; y++; }
+              today.setTime(new Date(y, m - 1, day).getTime());
+            } else {
+              return null;
+            }
           }
         }
       }
@@ -343,11 +372,18 @@ function parseIntent(message) {
     checkOutDate = d.toISOString().slice(0, 10);
   }
 
+  // 人数
+  const partyMatch = message.match(/(\d+)\s*个?\s*人/);
+  const partySize = partyMatch ? parseInt(partyMatch[1]) : null;
+
+  // 预算意图
+  const hasBudgetIntent = /预算|多少钱|花费|费用|花多少|要多少/.test(message);
+
   // 追问决策
   const askBack = checkAskBack(message, intent, origin, destination, date);
 
   return { intent, origin, destination, poi, date, maxPrice, hotelType, stars, bedType,
-    nights, checkOutDate, seatClass, journeyType, depHourRange, sort, flightSort, askBack };
+    nights, checkOutDate, seatClass, journeyType, depHourRange, sort, flightSort, partySize, hasBudgetIntent, askBack };
 }
 
 // 追问决策表
@@ -646,22 +682,48 @@ function logQuery(entry) {
   } catch {}
 }
 
-// 复合意图检测：一句话含交通+酒店/景点
-function detectCompoundIntent(message) {
-  const hasTransport = /机票|航班|飞机|直飞|飞|火车|高铁|动车/.test(message);
+// 复合意图检测：一句话含交通+酒店/景点/预算/行程规划
+function detectCompoundIntent(message, parsed) {
+  const hasTransport = /机票|航班|飞机|直飞|飞|火车|高铁|动车|坐飞|做飞/.test(message);
   const hasHotel = /酒店|住宿|宾馆|民宿|住哪|客栈/.test(message);
   const hasPoi = /景点|好玩|必去/.test(message);
+  const hasBudget = /预算|多少钱|花费|费用|花多少|要多少/.test(message);
+  // 行程规划关键词：影城/乐园/玩/旅游/规划/计划/安排
+  const hasPlan = /影城|乐园|玩|旅游|规划|计划|安排|攻略/.test(message);
 
   const tasks = [];
   if (hasTransport) tasks.push('transport');
   if (hasHotel) tasks.push('hotel');
-  if (hasPoi) tasks.push('poi');
+  if (hasPoi || hasPlan) tasks.push('poi');
+  if (hasBudget) tasks.push('budget');
+
+  // 即使没有明确关键词，如果有出发地+目的地+规划意图，自动补全
+  if (parsed.origin && parsed.destination && hasPlan && !tasks.includes('transport')) {
+    tasks.push('transport');
+  }
+  if (parsed.destination && hasPlan && !tasks.includes('poi')) {
+    tasks.push('poi');
+  }
+  if (parsed.destination && hasPlan && !tasks.includes('hotel')) {
+    tasks.push('hotel');
+  }
+
   return tasks.length >= 2 ? tasks : null;
+}
+
+// 构建响应，自动附带 confirmed_context
+function buildReply(reply, parsed, traceId, extra = {}) {
+  const ctx = {};
+  if (parsed.origin) ctx.origin = parsed.origin;
+  if (parsed.destination) ctx.destination = parsed.destination;
+  if (parsed.date) ctx.date = parsed.date;
+  if (parsed.intent && parsed.intent !== 'general') ctx.intent = parsed.intent;
+  return { reply, trace_id: traceId, confirmed_context: ctx, ...extra };
 }
 
 // 聊天接口
 app.post('/api/chat', async (req, res) => {
-  const { message, session_id, parent_trace_id } = req.body;
+  const { message, session_id, parent_trace_id, context: clientContext } = req.body;
   if (!message || !message.trim()) {
     return res.json({ reply: '请输入您的旅行需求，比如"帮我查杭州的酒店"' });
   }
@@ -678,9 +740,24 @@ app.post('/api/chat', async (req, res) => {
   try {
     const t0 = Date.now();
     const parsed = parseIntent(message);
+
+    // 合并客户端上下文：之前确认的实体不丢失
+    if (clientContext) {
+      if (!parsed.origin && clientContext.origin) parsed.origin = clientContext.origin;
+      if (!parsed.destination && clientContext.destination) parsed.destination = clientContext.destination;
+      if (!parsed.date && clientContext.date) parsed.date = clientContext.date;
+      if (!parsed.intent || parsed.intent === 'general') {
+        if (clientContext.intent && clientContext.intent !== 'general') parsed.intent = clientContext.intent;
+      }
+    }
+
+    // 合并后重新计算追问
+    parsed.askBack = checkAskBack(message, parsed.intent, parsed.origin, parsed.destination, parsed.date);
+
     trace.addStep('intent_parse', { raw: message }, {
       intent: parsed.intent, origin: parsed.origin, destination: parsed.destination,
       date: parsed.date, poi: parsed.poi, maxPrice: parsed.maxPrice,
+      merged_context: !!clientContext,
     }, Date.now() - t0);
     let reply;
 
@@ -692,11 +769,11 @@ app.post('/api/chat', async (req, res) => {
       reply = `${ab.question}\n${options}\n\n直接告诉我城市名也行 👆`;
       trace.setResult({ intent: parsed.intent, asked_back: true, askback_field: ab.field, askback_options: ab.options });
       traceLogger.log(trace.toJSON());
-      return res.json({ reply, askBack: ab, trace_id: trace.trace_id });
+      return res.json(buildReply(reply, parsed, trace.trace_id, { askBack: ab }));
     }
 
     // 复合意图拆解：一句话含交通+酒店/景点
-    const compoundTasks = detectCompoundIntent(message);
+    const compoundTasks = detectCompoundIntent(message, parsed);
     if (compoundTasks) {
       trace.addStep('compound_detect', { raw: message }, { tasks: compoundTasks });
       const results = [];
@@ -705,16 +782,18 @@ app.post('/api/chat', async (req, res) => {
       const dt = parsed.date;
       let compoundAskBack = null;
 
+      // 提取景点关键词
+      const poiKwMatch = message.match(/(环球影城|迪士尼|故宫|长城|欢乐谷|长隆|方特|海昌|融创|宋城|海洋馆|博物馆|动物园|植物园|西湖|外滩|东方明珠|兵马俑|鼓浪屿|张家界|九寨沟|黄山|泰山|少林寺|布达拉宫)/);
+      const poiKeyword = parsed.poi || poiKwMatch?.[1] || null;
+
       for (const task of compoundTasks) {
         try {
           if (task === 'transport') {
-            // 交通缺出发地时，跳过交通部分，追加追问
             if (!orig) {
               compoundAskBack = { field: 'origin', question: `从哪里出发去${dest}？`, options: ['上海', '北京', '广州', '深圳'] };
               trace.addStep('askback_check', { task: 'transport' }, { triggered: true, field: 'origin', reason: 'missing_origin' });
               continue;
             }
-            // 判断是机票还是火车
             const isFlight = /机票|航班|飞机|直飞|飞/.test(message) && !/火车|高铁|动车/.test(message);
             const isTrain = /火车|高铁|动车/.test(message) && !/机票|航班|飞机|直飞|飞/.test(message);
             if (isFlight) {
@@ -722,7 +801,7 @@ app.post('/api/chat', async (req, res) => {
               const data = await searchFlights(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType, flightSort: parsed.flightSort, depHourRange: parsed.depHourRange });
               const items = data?.data?.itemList || [];
               trace.addStep('provider_call', { provider: 'search_flight', origin: orig, destination: dest, date: dt }, { provider: 'search_flight', success: true, result_count: items.length }, Date.now() - t1);
-              results.push({ type: 'flight', label: '✈️ 机票', content: formatFlights(data, orig, dest) });
+              results.push({ type: 'flight', label: '✈️ 机票', content: formatFlights(data, orig, dest), data });
             } else if (isTrain) {
               const t1 = Date.now();
               const data = await searchTrains(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType });
@@ -739,9 +818,8 @@ app.post('/api/chat', async (req, res) => {
                 if (transfer) trainReply = trainReply ? `${trainReply}\n\n${transfer}` : transfer;
               }
               if (!trainReply) trainReply = `未找到${orig || ''}→${dest || ''}的火车票信息`;
-              results.push({ type: 'train', label: '🚄 火车票', content: trainReply });
+              results.push({ type: 'train', label: '🚄 火车票', content: trainReply, data });
             } else {
-              // 都有或都不明确，两个都查
               const t1 = Date.now();
               const [fData, tData] = await Promise.all([
                 searchFlights(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType }),
@@ -750,23 +828,26 @@ app.post('/api/chat', async (req, res) => {
               const fItems = fData?.data?.itemList || [];
               const tItems = tData?.data?.itemList || [];
               trace.addStep('provider_call', { provider: 'search_flight+search_domestic_train' }, { provider: 'search_flight+search_domestic_train', success: true, result_count: fItems.length + tItems.length }, Date.now() - t1);
-              results.push({ type: 'flight', label: '✈️ 机票', content: formatFlights(fData, orig, dest) });
+              results.push({ type: 'flight', label: '✈️ 机票', content: formatFlights(fData, orig, dest), data: fData });
               let trainReply = formatTrains(tData, orig, dest);
               if (!trainReply) trainReply = `未找到火车票信息`;
-              results.push({ type: 'train', label: '🚄 火车票', content: trainReply });
+              results.push({ type: 'train', label: '🚄 火车票', content: trainReply, data: tData });
             }
           } else if (task === 'hotel') {
             const t1 = Date.now();
             const data = await searchHotels(dest, dt, { poi: parsed.poi, maxPrice: parsed.maxPrice, hotelType: parsed.hotelType, stars: parsed.stars, bedType: parsed.bedType, checkOutDate: parsed.checkOutDate, sort: parsed.sort });
             const items = data?.data?.itemList || [];
             trace.addStep('provider_call', { provider: 'search_hotels', city: dest, date: dt }, { provider: 'search_hotels', success: true, result_count: items.length }, Date.now() - t1);
-            results.push({ type: 'hotel', label: '🏨 酒店', content: formatHotels(data, dest) });
+            results.push({ type: 'hotel', label: '🏨 酒店', content: formatHotels(data, dest), data });
           } else if (task === 'poi') {
             const t1 = Date.now();
-            const data = await searchPoi(dest, parsed.poi);
+            const data = await searchPoi(dest, poiKeyword);
             const items = data?.data?.itemList || [];
-            trace.addStep('provider_call', { provider: 'search_poi', city: dest, keyword: parsed.poi }, { provider: 'search_poi', success: true, result_count: items.length }, Date.now() - t1);
-            results.push({ type: 'poi', label: '🎯 景点', content: formatPoi(data, dest) });
+            trace.addStep('provider_call', { provider: 'search_poi', city: dest, keyword: poiKeyword }, { provider: 'search_poi', success: true, result_count: items.length }, Date.now() - t1);
+            results.push({ type: 'poi', label: '🎯 景点/玩乐', content: formatPoi(data, dest), data });
+          } else if (task === 'budget') {
+            // 预算计算：基于已有结果估算
+            results.push({ type: 'budget', label: '💰 预算估算', content: null }); // 占位，后面填充
           }
         } catch (err) {
           trace.addStep('provider_call', { task }, { provider: task, success: false, error: err.message });
@@ -774,7 +855,63 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
-      reply = results.map(r => `${r.label}\n${'─'.repeat(20)}\n${r.content}`).join('\n\n');
+      // 预算计算
+      const budgetResult = results.find(r => r.type === 'budget');
+      if (budgetResult) {
+        const partySize = parsed.partySize || 1;
+        const flightResult = results.find(r => r.type === 'flight');
+        const hotelResult = results.find(r => r.type === 'hotel');
+        const trainResult = results.find(r => r.type === 'train');
+
+        const lines = [];
+        lines.push(`👥 ${partySize}人出行`);
+
+        // 机票预算
+        if (flightResult?.data?.data?.itemList?.length > 0) {
+          const prices = flightResult.data.data.itemList.map(i => i.ticketPrice || 0).filter(p => p > 0);
+          if (prices.length > 0) {
+            const minP = Math.min(...prices);
+            const maxP = Math.max(...prices);
+            lines.push(`✈️ 机票：¥${minP}~${maxP}/人 × ${partySize}人 = ¥${minP * partySize}~${maxP * partySize}`);
+          }
+        }
+
+        // 火车票预算
+        if (trainResult?.data?.data?.itemList?.length > 0) {
+          const prices = trainResult.data.data.itemList.map(i => i.ticketPrice || i.price || 0).filter(p => p > 0);
+          if (prices.length > 0) {
+            const minP = Math.min(...prices);
+            const maxP = Math.max(...prices);
+            lines.push(`🚄 火车票：¥${minP}~${maxP}/人 × ${partySize}人 = ¥${minP * partySize}~${maxP * partySize}`);
+          }
+        }
+
+        // 酒店预算（按2晚估算）
+        if (hotelResult?.data?.data?.itemList?.length > 0) {
+          const prices = hotelResult.data.data.itemList.map(i => i.price || 0).filter(p => p > 0);
+          if (prices.length > 0) {
+            const minP = Math.min(...prices);
+            const maxP = Math.max(...prices);
+            const rooms = Math.ceil(partySize / 2);
+            lines.push(`🏨 酒店：¥${minP}~${maxP}/晚 × 2晚 × ${rooms}间 = ¥${minP * 2 * rooms}~${maxP * 2 * rooms}`);
+          }
+        }
+
+        // 景点门票（粗估）
+        const poiResult = results.find(r => r.type === 'poi');
+        if (poiResult?.data?.data?.itemList?.length > 0) {
+          const prices = poiResult.data.data.itemList.map(i => i.price || i.ticketPrice || 0).filter(p => p > 0);
+          if (prices.length > 0) {
+            const minP = Math.min(...prices);
+            const maxP = Math.max(...prices);
+            lines.push(`🎯 门票：¥${minP}~${maxP}/人 × ${partySize}人 = ¥${minP * partySize}~${maxP * partySize}`);
+          }
+        }
+
+        budgetResult.content = lines.join('\n');
+      }
+
+      reply = results.filter(r => r.content).map(r => `${r.label}\n${'─'.repeat(20)}\n${r.content}`).join('\n\n');
       // 复合意图中交通缺出发地时追加追问
       if (compoundAskBack) {
         const ab = compoundAskBack;
@@ -785,7 +922,7 @@ app.post('/api/chat', async (req, res) => {
       trace.addStep('response_format', { result_count: results.length }, { reply_length: reply.length, has_link: hasLink, has_askback: !!compoundAskBack });
       trace.setResult({ intent: 'compound:' + compoundTasks.join('+'), asked_back: !!compoundAskBack, askback_field: compoundAskBack?.field, askback_options: compoundAskBack?.options, result_count: results.length, has_link: hasLink });
       traceLogger.log(trace.toJSON());
-      return res.json({ reply, trace_id: trace.trace_id });
+      return res.json(buildReply(reply, parsed, trace.trace_id));
     }
 
     switch (parsed.intent) {
@@ -895,13 +1032,13 @@ app.post('/api/chat', async (req, res) => {
     trace.setResult({ intent: parsed.intent, result_count: resultCount, has_link: hasLink });
     traceLogger.log(trace.toJSON());
 
-    res.json({ reply, trace_id: trace.trace_id });
+    res.json(buildReply(reply, parsed, trace.trace_id));
   } catch (err) {
     console.error('查询失败:', err.message);
     trace.addStep('error', {}, { error: err.message });
     trace.fail(err.message);
     traceLogger.log(trace.toJSON());
-    res.json({ reply: '抱歉，查询出了点问题，请稍后再试', trace_id: trace.trace_id });
+    res.json({ reply: '抱歉，查询出了点问题，请稍后再试', trace_id: trace.trace_id, confirmed_context: {} });
   }
 });
 
