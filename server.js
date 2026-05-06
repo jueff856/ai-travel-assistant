@@ -122,45 +122,70 @@ function extractCities(message) {
   // "从X出发去Y" / "X出发去Y" / "X出发到Y" 模式
   const fromMatch = message.match(/从?\s*([一-龥]{2,4})\s*出发\s*(?:去|到|飞|往)\s*([一-龥]{2,4})/);
   if (fromMatch) {
-    const o = CITIES.find(c => fromMatch[1].includes(c));
-    const d = CITIES.find(c => fromMatch[2].includes(c));
-    if (o && d) return { origin: o, destination: d };
+    const o = CITIES.find(c => fromMatch[1].includes(c)) || fromMatch[1];
+    const d = CITIES.find(c => fromMatch[2].includes(c)) || fromMatch[2];
+    return { origin: o, destination: d };
   }
 
   // "X到/去/飞Y" 路线模式
   const routeMatch = message.match(/([一-龥]{2,4})\s*(?:到|去|飞|→|->)\s*([一-龥]{2,4})/);
   if (routeMatch) {
-    const o = CITIES.find(c => routeMatch[1].includes(c));
-    const d = CITIES.find(c => routeMatch[2].includes(c));
-    if (o && d) return { origin: o, destination: d };
-    if (CITIES.includes(routeMatch[1]) && CITIES.includes(routeMatch[2])) {
-      return { origin: routeMatch[1], destination: routeMatch[2] };
-    }
+    const o = CITIES.find(c => routeMatch[1].includes(c)) || routeMatch[1];
+    const d = CITIES.find(c => routeMatch[2].includes(c)) || routeMatch[2];
+    return { origin: o, destination: d };
   }
 
   // "X出发" 标记出发地，剩余城市为目的地
   const depOnlyMatch = message.match(/([一-龥]{2,4})\s*出发/);
   if (depOnlyMatch) {
-    const depCity = CITIES.find(c => depOnlyMatch[1].includes(c));
-    if (depCity) {
-      const others = found.filter(c => c !== depCity);
-      if (others.length > 0) return { origin: depCity, destination: others[0] };
-      return { origin: depCity, destination: null };
-    }
+    const depCity = CITIES.find(c => depOnlyMatch[1].includes(c)) || depOnlyMatch[1];
+    const others = found.filter(c => c !== depCity);
+    if (others.length > 0) return { origin: depCity, destination: others[0] };
+    return { origin: depCity, destination: null };
   }
 
   if (found.length >= 2) return { origin: found[0], destination: found[1] };
   if (found.length === 1) return { origin: null, destination: found[0] };
+
+  // Fallback: 提取任意2-4字中文城市名（交给飞猪API判断是否支持）
+  // "银川的酒店" → destination=银川
+  const citySuffixMatch = message.match(/([一-龥]{2,4})(?:的|机票|航班|火车|高铁|酒店|住宿|民宿|宾馆|景点|好玩)/);
+  if (citySuffixMatch) {
+    return { origin: null, destination: citySuffixMatch[1] };
+  }
+  // "去银川" / "到银川" / "飞银川"
+  const goToMatch = message.match(/(?:去|到|飞|往)\s*([一-龥]{2,4})/);
+  if (goToMatch) {
+    return { origin: null, destination: goToMatch[1] };
+  }
+
   return { origin: null, destination: null };
 }
 
 // 提取地标/景点关键词
 function extractPoi(message) {
+  // 1. 先查 landmarks.json 映射表
+  const landmarkNames = Object.keys(landmarksData.mappings);
+  for (const lm of landmarkNames) {
+    if (message.includes(lm)) return lm;
+  }
+  // 2. "城市+地标+附近/周边" 模式
   const cityPattern = CITIES.join('|');
-  const poiMatch = message.match(new RegExp(`(?:${cityPattern})([一-龥]{2,6})(?:附近|周边|旁边|周边)`));
+  const poiMatch = message.match(new RegExp(`(?:${cityPattern})([一-龥]{2,8})(?:附近|周边|旁边|周边)`));
   if (poiMatch) return poiMatch[1];
-  const plainMatch = message.match(/([一-龥]{2,6})(?:附近|周边|旁边)的?(?:酒店|住宿|宾馆|民宿|客栈)/);
+  // 3. "地标+附近/周边+酒店" 模式
+  const plainMatch = message.match(/([一-龥]{2,8})(?:附近|周边|旁边)的?(?:酒店|住宿|宾馆|民宿|客栈)/);
   if (plainMatch) return plainMatch[1];
+  // 4. "城市+地标" 模式（不需要"附近/周边"后缀），如 "三亚亚龙湾的酒店"
+  const cityPoiMatch = message.match(new RegExp(`(?:${cityPattern})([一-龥]{2,8}?)(?:的?(?:酒店|住宿|宾馆|民宿|客栈))`));
+  if (cityPoiMatch && !/^的/.test(cityPoiMatch[1])) return cityPoiMatch[1];
+  // 5. "地标+酒店" 直接模式，如 "亚特兰蒂斯酒店"（排除城市名）
+  const directMatch = message.match(/([一-龥]{2,8}?)的?(?:酒店|住宿|宾馆|民宿|客栈)/);
+  if (directMatch && !CITIES.includes(directMatch[1]) && directMatch[1].length >= 2) {
+    // 检查匹配到的词是否紧跟在"查/找/看/要/订"等动词后面，如果是则跳过（那是城市名不是地标）
+    const verbPrefix = message.match(/[查找看要订搜问帮](.+?)(?:的)?(?:酒店|住宿|宾馆|民宿|客栈)/);
+    if (!verbPrefix || verbPrefix[1].trim() !== directMatch[1]) return directMatch[1];
+  }
   return null;
 }
 
@@ -374,7 +399,14 @@ function parseIntent(message) {
 
   // 人数
   const partyMatch = message.match(/(\d+)\s*个?\s*人/);
-  const partySize = partyMatch ? parseInt(partyMatch[1]) : null;
+  const cnNumMatch = message.match(/([一二三四五六七八九两])\s*大\s*([一二三四五六七八九两])?\s*小/);
+  const cnNumMap = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '两': 2 };
+  let partySize = partyMatch ? parseInt(partyMatch[1]) : null;
+  if (!partySize && cnNumMatch) {
+    const adults = cnNumMap[cnNumMatch[1]] || 0;
+    const kids = cnNumMatch[2] ? (cnNumMap[cnNumMatch[2]] || 0) : 0;
+    partySize = adults + kids;
+  }
 
   // 预算意图
   const hasBudgetIntent = /预算|多少钱|花费|费用|花多少|要多少/.test(message);
@@ -426,11 +458,13 @@ function checkAskBack(message, intent, origin, destination, date) {
 
 // 搜索函数
 async function searchHotels(city, date, opts = {}) {
-  const args = { destName: city || '杭州', sort: opts.sort || 'price_asc', limit: 10 };
+  const args = { destName: city || '杭州', sort: opts.sort || 'rate_desc', limit: 10 };
   if (date) args.checkInDate = date;
   if (opts.checkOutDate) args.checkOutDate = opts.checkOutDate;
   if (opts.poi) args.poiName = opts.poi;
   if (opts.maxPrice) args.maxPrice = opts.maxPrice;
+  // 多人出行时过滤掉青旅（最低价太低的基本是青旅/床位房）
+  if (opts.partySize && opts.partySize > 1) args.minPrice = 100;
   if (opts.hotelType) args.hotelTypes = opts.hotelType;
   if (opts.stars) args.hotelStars = opts.stars;
   if (opts.bedType) args.hotelBedTypes = opts.bedType;
@@ -782,8 +816,9 @@ app.post('/api/chat', async (req, res) => {
       const dt = parsed.date;
       let compoundAskBack = null;
 
-      // 提取景点关键词
-      const poiKwMatch = message.match(/(环球影城|迪士尼|故宫|长城|欢乐谷|长隆|方特|海昌|融创|宋城|海洋馆|博物馆|动物园|植物园|西湖|外滩|东方明珠|兵马俑|鼓浪屿|张家界|九寨沟|黄山|泰山|少林寺|布达拉宫)/);
+      // 提取景点关键词（landmarks + 知名景点）
+      const allPoiNames = Object.keys(landmarksData.mappings).concat(['环球影城','迪士尼','故宫','长城','欢乐谷','长隆','方特','海昌','融创','宋城','海洋馆','博物馆','动物园','植物园','兵马俑','张家界','九寨沟','黄山','泰山','少林寺','布达拉宫']);
+      const poiKwMatch = message.match(new RegExp(`(${allPoiNames.join('|')})`));
       const poiKeyword = parsed.poi || poiKwMatch?.[1] || null;
 
       for (const task of compoundTasks) {
@@ -835,7 +870,7 @@ app.post('/api/chat', async (req, res) => {
             }
           } else if (task === 'hotel') {
             const t1 = Date.now();
-            const data = await searchHotels(dest, dt, { poi: parsed.poi, maxPrice: parsed.maxPrice, hotelType: parsed.hotelType, stars: parsed.stars, bedType: parsed.bedType, checkOutDate: parsed.checkOutDate, sort: parsed.sort });
+            const data = await searchHotels(dest, dt, { poi: poiKeyword || parsed.poi, maxPrice: parsed.maxPrice, hotelType: parsed.hotelType, stars: parsed.stars, bedType: parsed.bedType, checkOutDate: parsed.checkOutDate, sort: parsed.sort, partySize: parsed.partySize });
             const items = data?.data?.itemList || [];
             trace.addStep('provider_call', { provider: 'search_hotels', city: dest, date: dt }, { provider: 'search_hotels', success: true, result_count: items.length }, Date.now() - t1);
             results.push({ type: 'hotel', label: '🏨 酒店', content: formatHotels(data, dest), data });
@@ -936,6 +971,7 @@ app.post('/api/chat', async (req, res) => {
           bedType: parsed.bedType,
           checkOutDate: parsed.checkOutDate,
           sort: parsed.sort,
+          partySize: parsed.partySize,
         });
         const items = data?.data?.itemList || [];
         trace.addStep('provider_call', { provider: 'search_hotels', city: parsed.destination, date: parsed.date }, { provider: 'search_hotels', success: true, result_count: items.length }, Date.now() - t1);

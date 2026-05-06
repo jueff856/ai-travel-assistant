@@ -1,0 +1,14 @@
+[
+  {
+    "id": "bug-001",
+    "timestamp": "2026-05-06T22:30:00+08:00",
+    "error_message": "Vercel 500 FUNCTION_INVOCATION_FAILED - RuleEngine is not defined",
+    "file": "server.js",
+    "root_cause": "Missing require statement for RuleEngine. During Task 2 edits, the line `const RuleEngine = require('./knowledge/rules/index')` was never added, but line 20 used `new RuleEngine()`",
+    "fix": "Added `const RuleEngine = require('./knowledge/rules/index');` after the Orchestrator require line",
+    "tags": ["require", "missing-import", "runtime-error", "vercel-500"],
+    "related_bugs": [],
+    "occurrences": 1,
+    "last_seen": "2026-05-06T22:30:00+08:00"
+  }
+]
