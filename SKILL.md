@@ -1,11 +1,11 @@
 ---
-name: fliggy-travel
-description: 飞猪旅行搜索 — 查酒店、机票、火车票、景点，基于飞猪开放平台 API
+name: travel-search
+description: 旅行搜索 — 查酒店、机票、火车票、景点，实时价格和库存
 ---
 
-# Fliggy Travel Skill
+# Travel Skill
 
-查询酒店、机票、火车票、景点门票。数据来自飞猪开放平台，实时价格和库存。
+查询酒店、机票、火车票、景点门票。实时价格和库存。
 
 ## 你是宿主 Agent，由你理解用户意图
 
@@ -106,4 +106,4 @@ Content-Type: application/json
 - 日期格式 YYYY-MM-DD，不传则查近期
 - 城市名用中文简称即可（"深圳"不是"深圳市"）
 - partySize 传了会自动算多人总价
-- 飞猪链接在 reply 里，用户可直接点击预订
+- 搜索结果里带预订链接，用户可直接点击

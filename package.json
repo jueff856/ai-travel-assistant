@@ -1,7 +1,7 @@
 {
   "name": "ai-travel-assistant",
   "version": "1.0.0",
-  "description": "AI旅行助手 - 飞猪API + 智能推荐",
+  "description": "AI旅行助手 - 智能查酒店、机票、火车票、景点",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
