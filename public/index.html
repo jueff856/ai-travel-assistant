@@ -192,6 +192,15 @@
     const messages = document.getElementById('messages');
     const sendBtn = document.getElementById('sendBtn');
 
+    // session_id: 首次访问生成，localStorage持久化
+    if (!localStorage.getItem('travel_session_id')) {
+      localStorage.setItem('travel_session_id', 'sess_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8));
+    }
+    const sessionId = localStorage.getItem('travel_session_id');
+
+    // 追问链路：记录上一个trace_id
+    let lastTraceId = null;
+
     input.addEventListener('keydown', e => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -212,14 +221,20 @@
       const typingEl = appendTyping();
 
       try {
+        const body = { message: text, session_id: sessionId };
+        // 如果是追问回答，带上parent_trace_id
+        if (overrideText && lastTraceId) {
+          body.parent_trace_id = lastTraceId;
+        }
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text }),
+          body: JSON.stringify(body),
         });
         const data = await res.json();
         typingEl.remove();
-        appendMessage('bot', data.reply, data.askBack);
+        lastTraceId = data.trace_id || null;
+        appendMessage('bot', data.reply, data.askBack, data.trace_id);
       } catch {
         typingEl.remove();
         appendMessage('bot', '网络错误，请稍后重试');
@@ -229,9 +244,10 @@
       input.focus();
     }
 
-    function appendMessage(role, text, askBack) {
+    function appendMessage(role, text, askBack, traceId) {
       const div = document.createElement('div');
       div.className = `message ${role}`;
+      if (traceId) div.dataset.traceId = traceId;
       let bubbleContent;
       if (role === 'bot') {
         bubbleContent = escapeHtml(text);
@@ -258,6 +274,18 @@
       appendMessage('user', text);
       sendMessage(text);
     }
+
+    // 链接点击追踪
+    document.addEventListener('click', e => {
+      const link = e.target.closest('a[href]');
+      if (link && lastTraceId) {
+        fetch('/api/track', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ event: 'click', trace_id: lastTraceId, url: link.href }),
+        }).catch(() => {});
+      }
+    });
 
     function appendTyping() {
       const div = document.createElement('div');

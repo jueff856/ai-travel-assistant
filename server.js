@@ -3,6 +3,8 @@ const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const Trace = require('./lib/trace');
+const traceLogger = require('./lib/logger');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -661,38 +663,44 @@ function detectCompoundIntent(message) {
 
 // 聊天接口
 app.post('/api/chat', async (req, res) => {
-  const { message } = req.body;
+  const { message, session_id, parent_trace_id } = req.body;
   if (!message || !message.trim()) {
     return res.json({ reply: '请输入您的旅行需求，比如"帮我查杭州的酒店"' });
   }
 
+  // 创建 trace
+  const meta = {
+    user_agent: req.headers['user-agent'] || '',
+    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '',
+    vercel_region: req.headers['x-vercel-id'] || '',
+  };
+  const trace = new Trace(message, session_id, meta);
+  if (parent_trace_id) trace.setParent(parent_trace_id);
+
   try {
+    const t0 = Date.now();
     const parsed = parseIntent(message);
+    trace.addStep('intent_parse', { raw: message }, {
+      intent: parsed.intent, origin: parsed.origin, destination: parsed.destination,
+      date: parsed.date, poi: parsed.poi, maxPrice: parsed.maxPrice,
+    }, Date.now() - t0);
     let reply;
 
     // 追问机制：仅单意图时优先反问；复合意图在拆解中处理
     if (parsed.askBack && !detectCompoundIntent(message)) {
       const ab = parsed.askBack;
+      trace.addStep('askback_check', { intent: parsed.intent }, { triggered: true, field: ab.field, question: ab.question, options: ab.options });
       const options = ab.options.map(o => `[${o}]`).join('  ');
       reply = `${ab.question}\n${options}\n\n直接告诉我城市名也行 👆`;
-      logQuery({
-        timestamp: new Date().toISOString(),
-        input: message,
-        intent: parsed.intent,
-        origin: parsed.origin,
-        destination: parsed.destination,
-        date: parsed.date,
-        result_count: 0,
-        has_link: false,
-        asked_back: true,
-        ask_field: ab.field,
-      });
-      return res.json({ reply, askBack: ab });
+      trace.setResult({ intent: parsed.intent, asked_back: true, askback_field: ab.field, askback_options: ab.options });
+      traceLogger.log(trace.toJSON());
+      return res.json({ reply, askBack: ab, trace_id: trace.trace_id });
     }
 
     // 复合意图拆解：一句话含交通+酒店/景点
     const compoundTasks = detectCompoundIntent(message);
     if (compoundTasks) {
+      trace.addStep('compound_detect', { raw: message }, { tasks: compoundTasks });
       const results = [];
       const dest = parsed.destination;
       const orig = parsed.origin;
@@ -705,18 +713,24 @@ app.post('/api/chat', async (req, res) => {
             // 交通缺出发地时，跳过交通部分，追加追问
             if (!orig) {
               compoundAskBack = { field: 'origin', question: `从哪里出发去${dest}？`, options: ['上海', '北京', '广州', '深圳'] };
+              trace.addStep('askback_check', { task: 'transport' }, { triggered: true, field: 'origin', reason: 'missing_origin' });
               continue;
             }
             // 判断是机票还是火车
             const isFlight = /机票|航班|飞机|直飞|飞/.test(message) && !/火车|高铁|动车/.test(message);
             const isTrain = /火车|高铁|动车/.test(message) && !/机票|航班|飞机|直飞|飞/.test(message);
             if (isFlight) {
+              const t1 = Date.now();
               const data = await searchFlights(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType, flightSort: parsed.flightSort, depHourRange: parsed.depHourRange });
+              const items = data?.data?.itemList || [];
+              trace.addStep('provider_call', { provider: 'search_flight', origin: orig, destination: dest, date: dt }, { provider: 'search_flight', success: true, result_count: items.length }, Date.now() - t1);
               results.push({ type: 'flight', label: '✈️ 机票', content: formatFlights(data, orig, dest) });
             } else if (isTrain) {
+              const t1 = Date.now();
               const data = await searchTrains(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType });
-              let trainReply = formatTrains(data, orig, dest);
               const items = data?.data?.itemList || [];
+              trace.addStep('provider_call', { provider: 'search_domestic_train', origin: orig, destination: dest, date: dt }, { provider: 'search_domestic_train', success: true, result_count: items.length }, Date.now() - t1);
+              let trainReply = formatTrains(data, orig, dest);
               const hasDirectToDest = items.some(it => {
                 const seg = it.journeys?.[0]?.segments?.[0];
                 if (!seg) return false;
@@ -730,23 +744,34 @@ app.post('/api/chat', async (req, res) => {
               results.push({ type: 'train', label: '🚄 火车票', content: trainReply });
             } else {
               // 都有或都不明确，两个都查
+              const t1 = Date.now();
               const [fData, tData] = await Promise.all([
                 searchFlights(orig, dest, dt, { seatClass: parsed.seatClass, journeyType: parsed.journeyType }),
                 searchTrains(orig, dest, dt, { seatClass: parsed.seatClass }),
               ]);
+              const fItems = fData?.data?.itemList || [];
+              const tItems = tData?.data?.itemList || [];
+              trace.addStep('provider_call', { provider: 'search_flight+search_domestic_train' }, { provider: 'search_flight+search_domestic_train', success: true, result_count: fItems.length + tItems.length }, Date.now() - t1);
               results.push({ type: 'flight', label: '✈️ 机票', content: formatFlights(fData, orig, dest) });
               let trainReply = formatTrains(tData, orig, dest);
               if (!trainReply) trainReply = `未找到火车票信息`;
               results.push({ type: 'train', label: '🚄 火车票', content: trainReply });
             }
           } else if (task === 'hotel') {
+            const t1 = Date.now();
             const data = await searchHotels(dest, dt, { poi: parsed.poi, maxPrice: parsed.maxPrice, hotelType: parsed.hotelType, stars: parsed.stars, bedType: parsed.bedType, checkOutDate: parsed.checkOutDate, sort: parsed.sort });
+            const items = data?.data?.itemList || [];
+            trace.addStep('provider_call', { provider: 'search_hotels', city: dest, date: dt }, { provider: 'search_hotels', success: true, result_count: items.length }, Date.now() - t1);
             results.push({ type: 'hotel', label: '🏨 酒店', content: formatHotels(data, dest) });
           } else if (task === 'poi') {
+            const t1 = Date.now();
             const data = await searchPoi(dest, parsed.poi);
+            const items = data?.data?.itemList || [];
+            trace.addStep('provider_call', { provider: 'search_poi', city: dest, keyword: parsed.poi }, { provider: 'search_poi', success: true, result_count: items.length }, Date.now() - t1);
             results.push({ type: 'poi', label: '🎯 景点', content: formatPoi(data, dest) });
           }
         } catch (err) {
+          trace.addStep('provider_call', { task }, { provider: task, success: false, error: err.message });
           results.push({ type: task, label: task === 'hotel' ? '🏨 酒店' : task === 'poi' ? '🎯 景点' : '🚄 交通', content: `查询失败：${err.message}` });
         }
       }
@@ -758,22 +783,16 @@ app.post('/api/chat', async (req, res) => {
         const options = ab.options.map(o => `[${o}]`).join('  ');
         reply += `\n\n❓ ${ab.question}\n${options}\n直接告诉我城市名也行 👆`;
       }
-      logQuery({
-        timestamp: new Date().toISOString(),
-        input: message,
-        intent: 'compound:' + compoundTasks.join('+'),
-        origin: orig,
-        destination: dest,
-        date: dt,
-        result_count: results.length,
-        has_link: reply.includes('feizhu.com') || reply.includes('fliggy.com'),
-        asked_back: false,
-      });
-      return res.json({ reply });
+      const hasLink = reply.includes('feizhu.com') || reply.includes('fliggy.com');
+      trace.addStep('response_format', { result_count: results.length }, { reply_length: reply.length, has_link: hasLink, has_askback: !!compoundAskBack });
+      trace.setResult({ intent: 'compound:' + compoundTasks.join('+'), asked_back: !!compoundAskBack, askback_field: compoundAskBack?.field, askback_options: compoundAskBack?.options, result_count: results.length, has_link: hasLink });
+      traceLogger.log(trace.toJSON());
+      return res.json({ reply, trace_id: trace.trace_id });
     }
 
     switch (parsed.intent) {
       case 'hotel': {
+        const t1 = Date.now();
         const data = await searchHotels(parsed.destination, parsed.date, {
           poi: parsed.poi,
           maxPrice: parsed.maxPrice,
@@ -783,6 +802,8 @@ app.post('/api/chat', async (req, res) => {
           checkOutDate: parsed.checkOutDate,
           sort: parsed.sort,
         });
+        const items = data?.data?.itemList || [];
+        trace.addStep('provider_call', { provider: 'search_hotels', city: parsed.destination, date: parsed.date }, { provider: 'search_hotels', success: true, result_count: items.length }, Date.now() - t1);
         reply = formatHotels(data, parsed.destination);
         // 日期已过提示
         if (reply.includes('未找到') && parsed.date) {
@@ -796,6 +817,7 @@ app.post('/api/chat', async (req, res) => {
         break;
       }
       case 'flight': {
+        const t1 = Date.now();
         const data = await searchFlights(parsed.origin, parsed.destination, parsed.date, {
           seatClass: parsed.seatClass,
           journeyType: parsed.journeyType,
@@ -803,6 +825,8 @@ app.post('/api/chat', async (req, res) => {
           flightSort: parsed.flightSort,
           depHourRange: parsed.depHourRange,
         });
+        const items = data?.data?.itemList || [];
+        trace.addStep('provider_call', { provider: 'search_flight', origin: parsed.origin, destination: parsed.destination, date: parsed.date }, { provider: 'search_flight', success: true, result_count: items.length }, Date.now() - t1);
         reply = formatFlights(data, parsed.origin, parsed.destination);
         // 远期日期数据不全提示
         if (parsed.date) {
@@ -818,14 +842,16 @@ app.post('/api/chat', async (req, res) => {
         break;
       }
       case 'train': {
+        const t1 = Date.now();
         const data = await searchTrains(parsed.origin, parsed.destination, parsed.date, {
           seatClass: parsed.seatClass,
           journeyType: parsed.journeyType,
           maxPrice: parsed.maxPrice,
         });
+        const items = data?.data?.itemList || [];
+        trace.addStep('provider_call', { provider: 'search_domestic_train', origin: parsed.origin, destination: parsed.destination, date: parsed.date }, { provider: 'search_domestic_train', success: true, result_count: items.length }, Date.now() - t1);
         reply = formatTrains(data, parsed.origin, parsed.destination);
         // 判断是否需要推荐中转：直达结果为空，或没有真正到达目的地的车次
-        const items = data?.data?.itemList || [];
         const hasDirectToDest = items.some(it => {
           const seg = it.journeys?.[0]?.segments?.[0];
           if (!seg) return false;
@@ -854,34 +880,59 @@ app.post('/api/chat', async (req, res) => {
         break;
       }
       case 'poi': {
+        const t1 = Date.now();
         const data = await searchPoi(parsed.destination, parsed.poi);
+        const items = data?.data?.itemList || [];
+        trace.addStep('provider_call', { provider: 'search_poi', city: parsed.destination, keyword: parsed.poi }, { provider: 'search_poi', success: true, result_count: items.length }, Date.now() - t1);
         reply = formatPoi(data, parsed.destination);
         break;
       }
       default: {
+        const t1 = Date.now();
         const data = await aiSearch(message);
+        trace.addStep('provider_call', { provider: 'fliggy_ai_search', query: message }, { provider: 'fliggy_ai_search', success: true }, Date.now() - t1);
         reply = formatAiResult(data);
       }
     }
 
-    // 埋点记录
-    logQuery({
-      timestamp: new Date().toISOString(),
-      input: message,
-      intent: parsed.intent,
-      origin: parsed.origin,
-      destination: parsed.destination,
-      date: parsed.date,
-      result_count: (reply.match(/^\d+\./gm) || []).length,
-      has_link: reply.includes('feizhu.com') || reply.includes('fliggy.com'),
-      asked_back: false,
-    });
+    // 记录 trace
+    const hasLink = reply.includes('feizhu.com') || reply.includes('fliggy.com');
+    const resultCount = (reply.match(/^\d+\./gm) || []).length;
+    trace.addStep('response_format', { intent: parsed.intent }, { reply_length: reply.length, has_link: hasLink });
+    trace.setResult({ intent: parsed.intent, result_count: resultCount, has_link: hasLink });
+    traceLogger.log(trace.toJSON());
 
-    res.json({ reply });
+    res.json({ reply, trace_id: trace.trace_id });
   } catch (err) {
     console.error('查询失败:', err.message);
-    res.json({ reply: '抱歉，查询出了点问题，请稍后再试' });
+    trace.addStep('error', {}, { error: err.message });
+    trace.fail(err.message);
+    traceLogger.log(trace.toJSON());
+    res.json({ reply: '抱歉，查询出了点问题，请稍后再试', trace_id: trace.trace_id });
   }
+});
+
+// Trace 调试端点
+app.get('/api/traces', (req, res) => {
+  const { session, limit } = req.query;
+  const n = Math.min(parseInt(limit) || 20, 100);
+  if (session) {
+    return res.json({ traces: traceLogger.getBySession(session, n), stats: traceLogger.getStats() });
+  }
+  res.json({ traces: traceLogger.getRecent(n), stats: traceLogger.getStats() });
+});
+
+app.get('/api/traces/:id', (req, res) => {
+  const trace = traceLogger.getById(req.params.id);
+  if (!trace) return res.status(404).json({ error: 'trace not found' });
+  res.json(trace);
+});
+
+// 前端事件追踪（点击等）
+app.post('/api/track', (req, res) => {
+  const { event, trace_id, url, extra } = req.body;
+  console.log(`[TRACK] ${JSON.stringify({ event, trace_id, url, extra, timestamp: new Date().toISOString() })}`);
+  res.json({ ok: true });
 });
 
 if (require.main === module) {
